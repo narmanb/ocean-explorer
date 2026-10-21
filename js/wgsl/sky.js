@@ -223,7 +223,8 @@ fn skyViewUV(dir: vec3f) -> vec2f {
 }
 
 fn skyAtmo(dir: vec3f) -> vec3f {
-  return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+  let weather=min(F.stormP.x,1.0);
+  return textureSampleLevel(skyLUT,sampC,skyViewUV(dir),0.0).rgb*F.sunDir.w * mix(vec3f(1.0),vec3f(0.73,0.85,1.02),weather);
 }
 `;
 
@@ -257,12 +258,12 @@ fn cloudFbm(p: vec2f, fp: f32, oct: i32, billow: f32) -> f32 {
 // Signed "edge" functions (cloud where > 0) and their density ramps. The edge value is
 // what the sky pass differentiates (fwidth) to anti-alias the cloud silhouettes analytically.
 fn lowEdge(q: vec2f, fp: f32, oct: i32) -> f32 {
-  let t = F.cloudP.w;
+  let t = F.cloudP.w*(1.0+F.stormP.x*1.8);
   var p = q * 0.38 + vec2f(t * 0.004, t * 0.0012);
   let w = vec2f(gnoise(p * 0.3 + vec2f(1.7, 9.2)), gnoise(p * 0.3 + vec2f(8.3, 2.8)));
   p += w * 1.4;
   // slightly elongated cells (cloud streets), mildly billowy small scales for ragged edges
-  let base = cloudFbm(p * vec2f(1.0, 1.7), fp * 0.65, oct, 0.35) * 1.3 + 0.5;
+  let base = cloudFbm(p * vec2f(1.0, 1.7), fp * 0.65, oct, mix(0.35,0.72,min(F.stormP.x,1.0))) * 1.3 + 0.5;
   let large = gnoise(q * 0.05 + vec2f(3.1, 1.3)) * 0.7;
   return base + large - (1.0 - F.cloudP.y);
 }
@@ -271,7 +272,7 @@ fn lowDensity(q: vec2f, fp: f32, oct: i32) -> f32 {
   return clamp(lowEdge(q, fp, oct) / lowSoft(fp), 0.0, 1.0);
 }
 fn highEdge(q: vec2f, fp: f32, oct: i32) -> f32 {
-  let t = F.cloudP.w;
+  let t = F.cloudP.w*(1.0+F.stormP.x*1.8);
   // altostratus deck: smooth, slightly fibrous
   let p = CLOUD_ROT * (q * vec2f(0.09, 0.20)) + vec2f(t * 0.0015, 0.0);
   let n = cloudFbm(p, fp * 0.2, oct, 0.0) * 1.25 + 0.5;
@@ -297,9 +298,10 @@ fn hitLayer(dir: vec3f, hc: f32) -> CloudHit {
 
 // d: density at the hit; s1..s3: densities 80 m / 250 m / 600 m towards the sun
 fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f32, sigma: f32, g: f32) -> vec4f {
-  let tau = d * sigma / h.mu;
+  let optical=sigma*(1.0+F.stormP.x*1.8);
+  let tau = d * optical / h.mu;
   let alpha = 1.0 - exp(-tau);
-  let tauS = (d * 0.5 + s1 * 0.6 + s2 + s3 * 0.7) * sigma * 0.55;
+  let tauS = (d * 0.5 + s1 * 0.6 + s2 + s3 * 0.7) * optical * 0.55;
   let Ts = exp(-tauS);
   let sunC = sampleTrans(RG + hc, dot(h.up, F.sunDir.xyz)) * F.sunDir.w;
   let cosT = dot(dir, F.sunDir.xyz);
@@ -316,7 +318,7 @@ fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f3
   // bases are lit by the sky from the sides/below (horizon band + sea), cooler than the tops
   let amb = (skyAtmo(normalize(vec3f(dir.x, 0.03, dir.z))) * 0.26 + skyAtmo(vec3f(0.0, 1.0, 0.0)) * 0.42)
             * alpha * (1.0 - 0.35 * d);
-  return vec4f(single + ms + amb, alpha);
+  return vec4f(single + ms + amb*(1.0-0.6*min(F.stormP.x,1.0)), alpha);
 }
 
 // returns (premultiplied radiance, fraction of the background sky hidden)
@@ -332,7 +334,7 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
     let hc = F.cloudP.x;
     let h = hitLayer(dir, hc);
     // clear band near the horizon, where the low sun shines under the clouds
-    let far = 1.0 - smoothstep(18.0, 36.0, h.t);
+    let far = 1.0-smoothstep(mix(18.0,55.0,min(F.stormP.x,1.0)),mix(36.0,95.0,min(F.stormP.x,1.0)),h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
       let e = lowEdge(h.q, fp, 7);

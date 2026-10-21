@@ -29,6 +29,8 @@ struct Frame {
   foamP:    vec4f,     // J threshold, J gain, foam intensity, lace sharpness
   fogExt:   vec4f,     // rgb extinction per metre near sea level
   cloudP:   vec4f,     // altitude km, coverage, optical density, wind time
+  stormP:   vec4f,     // intensity, sea mist, spindrift, combined nominal Hs
+  seaP:     vec4f,     // conservative vertical bound, effective chop, -, -
 };
 `;
 

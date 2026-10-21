@@ -10,7 +10,8 @@
     "build": "node build.mjs",
     "check:build": "node build.mjs --check",
     "test": "node --test tests/*.test.mjs",
-    "test:browser": "node tests/browser-check.mjs"
+    "test:browser": "node tests/browser-check.mjs",
+    "test:render": "node tests/storm-render.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"

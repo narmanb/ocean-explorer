@@ -18,6 +18,8 @@ struct Sim {
   swell:      vec4f,  // Hs m, direction rad, peak omega, spreading exponent
   misc:       vec4f,  // choppiness, short wave cut (m), loop period s, seed
   timeP:      vec4f,  // time (looped), dt, foam gain, spectrum gain
+  cross:      vec4f,  // secondary Hs, direction, peak omega, concentration
+  sea:        vec4f,  // storm intensity, swell peak gamma, -, -
 };
 @group(0) @binding(0) var<uniform> S: Sim;
 
@@ -77,11 +79,17 @@ fn cosSpread(theta: f32, s: f32) -> f32 {
   return q * pow(abs(cos(theta * 0.5)), 2.0 * s);
 }
 
-fn spectrum(k: vec2f) -> f32 {
+fn swellSpectrum(k: vec2f, w: f32, theta: f32, swell: vec4f) -> f32 {
+  if (swell.x < 0.001) { return 0.0; }
+  let gamma = S.sea.y;
+  let hs4 = swell.x * 0.25;
+  let alpha = hs4 * hs4 * 5.0 * pow(swell.z, 4.0) / (GRAV * GRAV) * (1.0 - 0.287 * log(gamma));
+  return jonswap(w, swell.z, alpha, gamma) * cosSpread(wrapAngle(theta - swell.y), swell.w);
+}
+fn spectrum(k: vec2f) -> vec3f {
   let kl = length(k);
   let w = omegaOf(kl);
   let theta = atan2(k.y, k.x);
-  // fetch-limited wind sea (JONSWAP)
   let U = S.wind.x;
   let F = S.wind.z;
   var Sw = 0.0;
@@ -90,29 +98,27 @@ fn spectrum(k: vec2f) -> f32 {
     let wp = 22.0 * pow(GRAV * GRAV / (U * F), 1.0 / 3.0);
     Sw = jonswap(w, wp, alpha, S.wind.w) * donelanBanner(wrapAngle(theta - S.wind.y), w, wp);
   }
-  // swell: narrow, long-crested JONSWAP
-  if (S.swell.x > 0.001) {
-    let ws = S.swell.z;
-    let gs = 6.0;
-    let hs4 = S.swell.x * 0.25;
-    let alphaS = hs4 * hs4 * 5.0 * ws * ws * ws * ws / (GRAV * GRAV) * (1.0 - 0.287 * log(gs));
-    Sw += jonswap(w, ws, alphaS, gs) * cosSpread(wrapAngle(theta - S.swell.y), S.swell.w);
-  }
+  var energy = vec3f(Sw, swellSpectrum(k,w,theta,S.swell), swellSpectrum(k,w,theta,S.cross));
   // damp the very shortest waves
   let sc = S.misc.y;
-  Sw *= exp(-kl * kl * sc * sc);
-  return Sw * dOmegaOf(kl) / kl * S.timeP.w;
+  energy *= exp(-kl * kl * sc * sc);
+  return energy * dOmegaOf(kl) / kl * S.timeP.w;
 }
 
-fn amplitude(k: vec2f, c: u32) -> f32 {
+fn amplitude(k: vec2f, c: u32) -> vec3f {
   let kl = length(k);
-  if (kl < 1e-5 || kl < S.kMin[c >> 2u][c & 3u] || kl >= S.kMax[c >> 2u][c & 3u]) { return 0.0; }
+  if (kl < 1e-5 || kl < S.kMin[c >> 2u][c & 3u] || kl >= S.kMax[c >> 2u][c & 3u]) { return vec3f(0.0); }
   let dk = 2.0 * PI / S.L[c >> 2u][c & 3u];
   // the finest cascades are toned down (they otherwise read as crumpled foil)
   let g = select(1.0, select(0.85, 0.6, c == 5u), c >= 4u);
-  return sqrt(max(spectrum(k), 0.0)) * dk * 0.5 * g;
+  return sqrt(max(spectrum(k), vec3f(0.0))) * dk * 0.5 * g;
 }
 
+fn seededAmplitude(k: vec2f, c: u32, seed: u32) -> vec2f {
+  let a = amplitude(k,c);
+  // Independent phases keep an existing swell intact as another swell is introduced.
+  return gauss2(seed)*a.x + gauss2(seed+15485863u)*a.y + gauss2(seed+32452843u)*a.z;
+}
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let c = id.z;
@@ -121,8 +127,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let mx = (N - id.x) % N;
   let my = (N - id.y) % N;
   let seed = u32(S.misc.w) * 7919u + c * 1000003u;
-  let a = gauss2(seed + (id.y * N + id.x)) * amplitude(k, c);
-  let b = gauss2(seed + (my * N + mx)) * amplitude(-k, c);
+  let a = seededAmplitude(k,c,seed + id.y*N + id.x);
+  // Use the exact canonical partner, including +0 on frequency axes. Evaluating -k
+  // may change atan2 signed-zero behavior and leak imaginary height into packed Jxz.
+  let mirroredK=waveVec(mx,my,L);
+  let b = seededAmplitude(mirroredK,c,seed + my*N + mx);
   h0[(c * N + id.y) * N + id.x] = vec4f(a, b.x, -b.y);
 }
 `;
@@ -151,7 +160,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // h0(k) travels along +k: h(k,t) = h0(k) e^{-iwt} + conj(h0(-k)) e^{iwt}
   let h = cmul(H0.xy, vec2f(e.x, -e.y)) + cmul(H0.zw, e);
   let ih = mulI(h);
-  let lam = S.misc.x;
+  // Short capillary bands retain full height/slope detail, but do not inherit the
+  // enormous horizontal steepening of storm swells (avoids folded micro-geometry).
+  let lam = S.misc.x/(1.0+0.45*S.sea.x*f32(c));
   let ik = 1.0 / kl;
   let Dx = ih * (lam * k.x * ik);
   let Dz = ih * (lam * k.y * ik);
@@ -354,6 +365,7 @@ struct FoamU {
   cascL: array<vec4f, 2>,
   cascInvL: array<vec4f, 2>,
   drift: vec4f,              // foam drift velocity (m/s) xz
+  sea: vec4f,                // storm, nominal combined Hs, -, -
 };
 @group(0) @binding(0) var<uniform> U: FoamU;
 @group(0) @binding(1) var prevTex: texture_2d_array<f32>;
@@ -376,6 +388,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let inPrev = all(g >= plo) && all(g < plo + vec2i(RES));
   let p = (vec2f(g) + 0.5) * ts;
   var jxx = 0.0; var jzz = 0.0; var jxz = 0.0;
+  var height = 0.0; var slope = vec2f(0.0);
   for (var c = 0u; c < ${CASCADES}u; c++) {
     let texel = U.cascL[c >> 2u][c & 3u] / ${N}.0;
     let lod = log2(max(ts / texel, 1.0));
@@ -384,6 +397,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       let d = textureSampleLevel(derivTex, samp, uv, c, lod);
       let a = textureSampleLevel(dispTex, samp, uv, c, lod);
       jxx += d.z; jzz += d.w; jxz += a.w;
+      height += a.y; slope += d.xy;
     }
   }
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
@@ -394,7 +408,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     prev = textureSampleLevel(prevTex, sampPrev, back, lvl, 0.0);
   }
   let dt = U.p0.z;
-  let inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  let steepCrest = smoothstep(0.28,0.8,length(slope)) * smoothstep(0.02,0.28,height/max(U.sea.y,1.0));
+  let inject = max(clamp((U.p1.x-J)*U.p1.y,0.0,1.0), steepCrest*min(U.sea.x,1.0)*0.8);
   var f = prev.r * exp(-dt * U.p0.w);
   f = max(f, inject);
   f = min(f + inject * dt * U.p1.z, 1.6);
