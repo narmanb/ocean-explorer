@@ -75,6 +75,10 @@ async function main() {
   device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
 
   const canvas = document.getElementById('c');
+  const touchEnabled = qs.get('touch') === '1' ||
+    (qs.get('touch') !== '0' && matchMedia('(pointer:coarse)').matches);
+  document.body.classList.toggle('mobile-ui', touchEnabled);
+  let renderScale = 1;
   const ctx = canvas.getContext('webgpu');
   const swapFormat = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format: swapFormat, alphaMode: 'opaque', usage: TU.RENDER_ATTACHMENT | TU.COPY_SRC });
@@ -353,7 +357,7 @@ async function main() {
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = (touchEnabled ? 1 : (window.devicePixelRatio || 1)) * renderScale;
     const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
     const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
     if (w === W && h === H) return;
@@ -449,10 +453,11 @@ async function main() {
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
+  const touch = { fwd:0, str:0, up:0, boost:false };
   addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  canvas.addEventListener('click', () => { if (!touchEnabled && document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
   let dragging = false;
   canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
   addEventListener('mouseup', () => { dragging = false; });
@@ -470,13 +475,13 @@ async function main() {
   function updateCamera(dt) {
     const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
     let mx = 0, my = 0, mz = 0;
-    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-    const str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
-    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0);
+    const fwd = Math.max(-1, Math.min(1, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0) + touch.fwd));
+    const str = Math.max(-1, Math.min(1, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) + touch.str));
+    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0) + touch.up;
     mx += fwd * cp * sy + str * cy;
     my += fwd * sp + up;
     mz += -fwd * cp * cy + str * sy;
-    const boost = keys.ShiftLeft || keys.ShiftRight ? 5 : 1;
+    const boost = keys.ShiftLeft || keys.ShiftRight || touch.boost ? 5 : 1;
     const v = cam.speed * boost * dt;
     cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
     cam.y = Math.max(1.0, Math.min(3000, cam.y));
@@ -622,23 +627,191 @@ async function main() {
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
   ];
-  for (const [key, label, min, max, step, kind] of SLIDERS) {
-    const row = document.createElement('label');
-    const name = document.createElement('span'); name.textContent = label;
-    const val = document.createElement('output'); val.textContent = String(P[key]);
-    const inp = document.createElement('input');
-    Object.assign(inp, { type: 'range', min, max, step, value: P[key] });
-    inp.addEventListener('input', () => {
-      P[key] = Number(inp.value); val.textContent = inp.value;
-      if (kind === 'spec') needSpectrum = true;
-      if (kind === 'lut') needLUT = true;
-      envFull = 2;
-    });
-    row.append(name, inp, val);
-    panel.appendChild(row);
-  }
-  if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
+  // Apply URL overrides before creating slider values.
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
+  const panelHeading = document.createElement('div');
+  panelHeading.className = 'panel-heading';
+  const panelTitle = document.createElement('span');
+  panelTitle.textContent = 'Ocean settings';
+  const panelClose = document.createElement('button');
+  panelClose.className = 'panel-close';
+  panelClose.type = 'button';
+  panelClose.textContent = '×';
+  panelClose.setAttribute('aria-label', 'Close settings');
+  panelClose.addEventListener('click', () => panel.classList.add('hidden'));
+  panelHeading.append(panelTitle, panelClose);
+  panel.appendChild(panelHeading);
+  const sliders = new Map(SLIDERS.map((entry) => [entry[0], entry]));
+  const groupDefinitions = [
+    ['Wind', ['windSpeed', 'windDir', 'fetchKm']],
+    ['Waves', ['swellHs', 'swellLength', 'swellDir', 'choppy']],
+    ['Water', ['turbidity', 'foam']],
+    ['Sky & Atmosphere', ['sunElev', 'sunAzim', 'haze', 'clouds', 'veil']],
+    ['Graphics & Performance', ['exposure', 'bloom']],
+  ];
+  const categoryElements = [];
+  let graphicsControls;
+  for (const [category, keysInGroup] of groupDefinitions) {
+    const section = document.createElement('details');
+    section.className = 'settings-category';
+    const summary = document.createElement('summary');
+    summary.textContent = category;
+    const controls = document.createElement('div');
+    controls.className = 'category-controls';
+    if (category === 'Graphics & Performance') graphicsControls = controls;
+    for (const key of keysInGroup) {
+      const [sliderKey, label, min, max, step, kind] = sliders.get(key);
+      const row = document.createElement('label');
+      const name = document.createElement('span');
+      name.textContent = label;
+      const val = document.createElement('output');
+      val.textContent = String(P[sliderKey]);
+      const inp = document.createElement('input');
+      Object.assign(inp, { type:'range', min, max, step, value:P[sliderKey] });
+      inp.addEventListener('input', () => {
+        P[sliderKey] = Number(inp.value);
+        val.textContent = inp.value;
+        if (kind === 'spec') needSpectrum = true;
+        if (kind === 'lut') needLUT = true;
+        envFull = 2;
+      });
+      row.append(name, inp, val);
+      controls.appendChild(row);
+    }
+    section.append(summary, controls);
+    categoryElements.push(section);
+    section.addEventListener('toggle', () => {
+      if (section.open) for (const other of categoryElements) if (other !== section) other.open = false;
+    });
+    panel.appendChild(section);
+  }
+  const resolutionRow = document.createElement('label');
+  resolutionRow.className = 'resolution-row';
+  const resolutionName = document.createElement('span');
+  resolutionName.textContent = 'Resolution scale';
+  const panelQuality = document.createElement('select');
+  panelQuality.setAttribute('aria-label', 'Rendering resolution scale');
+  const mobileQuality = document.getElementById('mobile-quality');
+  panelQuality.innerHTML = mobileQuality.innerHTML;
+  resolutionRow.append(resolutionName, panelQuality);
+  graphicsControls.appendChild(resolutionRow);
+  function setResolution(value) {
+    const scale = Number(value);
+    if (![0.65, 1, 1.5, 2].includes(scale)) return;
+    renderScale = scale;
+    mobileQuality.value = String(scale);
+    panelQuality.value = String(scale);
+  }
+  mobileQuality.addEventListener('change', () => setResolution(mobileQuality.value));
+  panelQuality.addEventListener('change', () => setResolution(panelQuality.value));
+  const initialScale = Number(qs.get('scale'));
+  if ([0.65, 1, 1.5, 2].includes(initialScale)) setResolution(initialScale);
+  if (qs.get('ui') === '0') {
+    document.getElementById('hud').style.display = 'none';
+    panel.classList.add('hidden');
+  }
+
+  if (touchEnabled) {
+    const pad = document.getElementById('touch-stick');
+    const knob = document.getElementById('touch-knob');
+    const boost = document.getElementById('mobile-boost');
+    const upButton = document.getElementById('mobile-up');
+    const downButton = document.getElementById('mobile-down');
+    let stickPointer = null;
+    let lookPointer = null, lookX = 0, lookY = 0;
+    const verticalHeld = { up:false, down:false };
+    function stopStick() {
+      stickPointer = null;
+      touch.fwd = touch.str = 0;
+      knob.style.transform = 'translate(0px,0px)';
+    }
+    function moveStick(e) {
+      const r = pad.getBoundingClientRect();
+      let x = (e.clientX - r.left - r.width / 2) / (r.width * 0.38);
+      let y = (e.clientY - r.top - r.height / 2) / (r.height * 0.38);
+      const length = Math.hypot(x, y);
+      if (length > 1) { x /= length; y /= length; }
+      if (length < 0.12) x = y = 0;
+      knob.style.transform = 'translate(' + (x*r.width*0.27).toFixed(1) + 'px,' + (y*r.height*0.27).toFixed(1) + 'px)';
+      touch.fwd = -y;
+      touch.str = x;
+    }
+    pad.addEventListener('pointerdown', (e) => {
+      if (stickPointer !== null) return;
+      e.preventDefault();
+      stickPointer = e.pointerId;
+      pad.setPointerCapture(e.pointerId);
+      moveStick(e);
+    });
+    pad.addEventListener('pointermove', (e) => {
+      if (stickPointer === e.pointerId) { e.preventDefault(); moveStick(e); }
+    });
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      pad.addEventListener(event, (e) => { if (stickPointer === e.pointerId) stopStick(); });
+    }
+    canvas.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' || lookPointer !== null) return;
+      e.preventDefault();
+      lookPointer = e.pointerId;
+      lookX = e.clientX; lookY = e.clientY;
+      canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== lookPointer) return;
+      e.preventDefault();
+      const dx = e.clientX - lookX, dy = e.clientY - lookY;
+      lookX = e.clientX; lookY = e.clientY;
+      cam.yaw += dx * 0.0038;
+      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - dy * 0.0038));
+    });
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      canvas.addEventListener(event, (e) => { if (e.pointerId === lookPointer) lookPointer = null; });
+    }
+    function bindVertical(button, key) {
+      let active = null;
+      const sync = () => { touch.up = Number(verticalHeld.up) - Number(verticalHeld.down); };
+      button.addEventListener('pointerdown', (e) => {
+        if (active !== null) return;
+        e.preventDefault();
+        active = e.pointerId;
+        verticalHeld[key] = true;
+        button.classList.add('down');
+        button.setPointerCapture(e.pointerId);
+        sync();
+      });
+      for (const event of ['pointerup','pointercancel','lostpointercapture']) {
+        button.addEventListener(event, (e) => {
+          if (active !== e.pointerId) return;
+          active = null; verticalHeld[key] = false;
+          button.classList.remove('down'); sync();
+        });
+      }
+    }
+    bindVertical(upButton, 'up');
+    bindVertical(downButton, 'down');
+    boost.addEventListener('click', () => {
+      touch.boost = !touch.boost;
+      boost.classList.toggle('active', touch.boost);
+      boost.setAttribute('aria-pressed', String(touch.boost));
+    });
+    document.getElementById('mobile-settings').addEventListener('click', togglePanel);
+    document.getElementById('mobile-fullscreen').addEventListener('click', () => {
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.().catch(() => {});
+      } else {
+        document.documentElement.requestFullscreen?.().catch(() => {});
+      }
+    });
+    function resetTouch() {
+      stopStick(); lookPointer = null;
+      verticalHeld.up = verticalHeld.down = false;
+      touch.up = 0;
+      upButton.classList.remove('down');
+      downButton.classList.remove('down');
+    }
+    addEventListener('blur', resetTouch);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) resetTouch(); });
+  }
 
   const hudFps = document.getElementById('fps');
 
