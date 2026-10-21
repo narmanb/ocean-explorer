@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ocean — WebGPU</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ocean Explorer — WebGPU</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -17,6 +17,46 @@
   #panel input { width: 110px; accent-color: #e2a04e; }
   #panel output { text-align: right; font-variant-numeric: tabular-nums; opacity: .8; }
   #err { position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
+
+  #panel { z-index:25; display:block; width:min(355px,calc(100vw - 24px)); box-sizing:border-box; max-height:calc(100dvh - 26px); overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; }
+  #panel.hidden { display:none; }
+  .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:7px; font-size:15px; font-weight:700; }
+  .panel-close { border:1px solid #ffffff55; background:#263748; border-radius:7px; color:inherit; width:30px; height:30px; cursor:pointer; }
+  .settings-category { border-top:1px solid #ffffff29; }
+  .settings-category summary { cursor:pointer; padding:12px 5px; font-size:14px; font-weight:650; list-style:none; display:flex; justify-content:space-between; align-items:center; touch-action:manipulation; }
+  .settings-category summary::-webkit-details-marker { display:none; }
+  .settings-category summary::after { content:"⌄"; color:#d4dbe4; font-size:18px; line-height:1; }
+  .settings-category[open] summary::after { content:"⌃"; }
+  .category-controls { padding:4px 3px 13px; display:grid; gap:8px; }
+  #panel .category-controls label { display:grid; grid-template-columns:minmax(0,1fr) 108px 38px; align-items:center; gap:5px; margin:0; font-size:12px; }
+  #panel .category-controls input[type=range] { width:100%; min-width:0; accent-color:#e2a04e; touch-action:none; }
+  #panel .category-controls select { color:#e5e1d8; background:#253849; border:1px solid #ffffff55; border-radius:6px; padding:5px 2px; width:100%; }
+  #panel .category-controls output { text-align:right; font-variant-numeric:tabular-nums; opacity:.85; }
+  #panel .resolution-row { grid-template-columns:minmax(0,1fr) 152px !important; }
+  #touch-ui { display:none; position:fixed; inset:0; z-index:12; color:#f7fbff; font:600 12px system-ui,sans-serif; pointer-events:none; -webkit-user-select:none; user-select:none; }
+  body.mobile-ui, body.mobile-ui #c { touch-action:none; overscroll-behavior:none; }
+  body.mobile-ui #touch-ui { display:block; }
+  #touch-ui * { box-sizing:border-box; }
+  #touch-ui button,#touch-ui select,#touch-ui .joystick { pointer-events:auto; touch-action:none; }
+  #touch-bar { position:absolute; top:max(8px,env(safe-area-inset-top)); right:max(8px,env(safe-area-inset-right)); display:flex; align-items:center; gap:6px; }
+  #touch-bar button,#touch-bar select { background:#101d29ca; color:white; border:1px solid #ffffff75; border-radius:9px; min-height:40px; padding:0 12px; font:600 13px system-ui,sans-serif; }
+  #touch-bar select { width:136px; }
+  #touch-bar button:active,#touch-actions button.down { background:#7394ae; }
+  #touch-stick { position:absolute; bottom:max(15px,env(safe-area-inset-bottom)); left:max(18px,env(safe-area-inset-left)); width:120px; height:120px; border-radius:50%; border:2px solid #ffffff70; background:#31435766; box-shadow:0 3px 24px #0004; }
+  #touch-stick::before,#touch-stick::after { content:""; position:absolute; background:#ffffff29; pointer-events:none; }
+  #touch-stick::before { width:1px;top:13%;bottom:13%;left:50%; }
+  #touch-stick::after { height:1px;left:13%;right:13%;top:50%; }
+  #touch-knob { position:absolute; left:50%;top:50%;width:49px;height:49px; margin-left:-24.5px;margin-top:-24.5px; border-radius:50%; background:#bce8ff96; border:2px solid #f4fbffc0; box-shadow:0 1px 9px #0006; transform:translate(0,0); }
+  #touch-actions { position:absolute;bottom:max(15px,env(safe-area-inset-bottom));right:max(18px,env(safe-area-inset-right));display:grid;grid-template-columns:52px 52px;gap:9px; }
+  #touch-actions button { width:52px;height:52px;border-radius:50%;border:1px solid #ffffff6b;background:#26384bc2;color:white;font:700 12px system-ui,sans-serif; }
+  #touch-actions .wide { grid-column:span 2;width:113px;height:38px;border-radius:12px; }
+  #touch-actions button.active { background:#cbeafa;color:#162737; }
+  #look-hint { position:absolute;left:50%;bottom:28px;transform:translateX(-50%);white-space:nowrap;text-shadow:0 1px 5px #000b;color:#ffffffc4;pointer-events:none; }
+  body.mobile-ui #hud { z-index:6;max-width:43vw; font-size:11px; }
+  body.mobile-ui #hud .help {display:none;}
+  body.mobile-ui #panel { top:55px;right:10px;max-height:calc(100dvh - 62px); }
+  @media(max-width:670px) { body.mobile-ui #hud{font-size:10px;max-width:35vw;} #touch-stick{width:100px;height:100px;} #look-hint{font-size:10px;bottom:8px;} #touch-bar button{padding:0 8px;} #touch-bar select{width:112px;} }
+  @media(orientation:portrait) { #look-hint{bottom:155px;} }
 </style>
 </head>
 <body>
@@ -27,6 +67,25 @@
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>
+<div id="touch-ui" aria-label="Touchscreen exploration controls">
+  <div id="touch-bar">
+    <select id="mobile-quality" aria-label="Rendering resolution">
+      <option value="0.65">Low · 0.65×</option>
+      <option value="1" selected>Medium · 1×</option>
+      <option value="1.5">High · 1.5×</option>
+      <option value="2">Ultra · 2×</option>
+    </select>
+    <button id="mobile-settings" type="button" aria-label="Settings">Settings</button>
+    <button id="mobile-fullscreen" type="button" aria-label="Toggle fullscreen">⛶</button>
+  </div>
+  <div id="touch-stick" class="joystick" aria-label="Move"><div id="touch-knob"></div></div>
+  <div id="touch-actions">
+    <button id="mobile-up" type="button">UP</button>
+    <button id="mobile-down" type="button">DOWN</button>
+    <button id="mobile-boost" type="button" class="wide" aria-pressed="false">FAST 5×</button>
+  </div>
+  <div id="look-hint">Drag the water to look around</div>
+</div>
 <script type="module">
 // ---- js/wgsl/common.js ----
 // Shared constants and WGSL snippets.
@@ -1627,6 +1686,10 @@ async function main() {
   device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
 
   const canvas = document.getElementById('c');
+  const touchEnabled = qs.get('touch') === '1' ||
+    (qs.get('touch') !== '0' && matchMedia('(pointer:coarse)').matches);
+  document.body.classList.toggle('mobile-ui', touchEnabled);
+  let renderScale = 1;
   const ctx = canvas.getContext('webgpu');
   const swapFormat = navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({ device, format: swapFormat, alphaMode: 'opaque', usage: TU.RENDER_ATTACHMENT | TU.COPY_SRC });
@@ -1905,7 +1968,7 @@ async function main() {
 
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = (touchEnabled ? 1 : (window.devicePixelRatio || 1)) * renderScale;
     const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
     const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
     if (w === W && h === H) return;
@@ -2001,10 +2064,11 @@ async function main() {
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
+  const touch = { fwd:0, str:0, up:0, boost:false };
   addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  canvas.addEventListener('click', () => { if (!touchEnabled && document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
   let dragging = false;
   canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
   addEventListener('mouseup', () => { dragging = false; });
@@ -2022,13 +2086,13 @@ async function main() {
   function updateCamera(dt) {
     const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
     let mx = 0, my = 0, mz = 0;
-    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
-    const str = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
-    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0);
+    const fwd = Math.max(-1, Math.min(1, (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0) + touch.fwd));
+    const str = Math.max(-1, Math.min(1, (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) + touch.str));
+    const up = (keys.KeyE || keys.Space ? 1 : 0) - (keys.KeyQ || keys.KeyC ? 1 : 0) + touch.up;
     mx += fwd * cp * sy + str * cy;
     my += fwd * sp + up;
     mz += -fwd * cp * cy + str * sy;
-    const boost = keys.ShiftLeft || keys.ShiftRight ? 5 : 1;
+    const boost = keys.ShiftLeft || keys.ShiftRight || touch.boost ? 5 : 1;
     const v = cam.speed * boost * dt;
     cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
     cam.y = Math.max(1.0, Math.min(3000, cam.y));
@@ -2174,23 +2238,191 @@ async function main() {
     ['exposure', 'Exposure', 0.1, 4, 0.01, ''],
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
   ];
-  for (const [key, label, min, max, step, kind] of SLIDERS) {
-    const row = document.createElement('label');
-    const name = document.createElement('span'); name.textContent = label;
-    const val = document.createElement('output'); val.textContent = String(P[key]);
-    const inp = document.createElement('input');
-    Object.assign(inp, { type: 'range', min, max, step, value: P[key] });
-    inp.addEventListener('input', () => {
-      P[key] = Number(inp.value); val.textContent = inp.value;
-      if (kind === 'spec') needSpectrum = true;
-      if (kind === 'lut') needLUT = true;
-      envFull = 2;
-    });
-    row.append(name, inp, val);
-    panel.appendChild(row);
-  }
-  if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
+  // Apply URL overrides before creating slider values.
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
+  const panelHeading = document.createElement('div');
+  panelHeading.className = 'panel-heading';
+  const panelTitle = document.createElement('span');
+  panelTitle.textContent = 'Ocean settings';
+  const panelClose = document.createElement('button');
+  panelClose.className = 'panel-close';
+  panelClose.type = 'button';
+  panelClose.textContent = '×';
+  panelClose.setAttribute('aria-label', 'Close settings');
+  panelClose.addEventListener('click', () => panel.classList.add('hidden'));
+  panelHeading.append(panelTitle, panelClose);
+  panel.appendChild(panelHeading);
+  const sliders = new Map(SLIDERS.map((entry) => [entry[0], entry]));
+  const groupDefinitions = [
+    ['Wind', ['windSpeed', 'windDir', 'fetchKm']],
+    ['Waves', ['swellHs', 'swellLength', 'swellDir', 'choppy']],
+    ['Water', ['turbidity', 'foam']],
+    ['Sky & Atmosphere', ['sunElev', 'sunAzim', 'haze', 'clouds', 'veil']],
+    ['Graphics & Performance', ['exposure', 'bloom']],
+  ];
+  const categoryElements = [];
+  let graphicsControls;
+  for (const [category, keysInGroup] of groupDefinitions) {
+    const section = document.createElement('details');
+    section.className = 'settings-category';
+    const summary = document.createElement('summary');
+    summary.textContent = category;
+    const controls = document.createElement('div');
+    controls.className = 'category-controls';
+    if (category === 'Graphics & Performance') graphicsControls = controls;
+    for (const key of keysInGroup) {
+      const [sliderKey, label, min, max, step, kind] = sliders.get(key);
+      const row = document.createElement('label');
+      const name = document.createElement('span');
+      name.textContent = label;
+      const val = document.createElement('output');
+      val.textContent = String(P[sliderKey]);
+      const inp = document.createElement('input');
+      Object.assign(inp, { type:'range', min, max, step, value:P[sliderKey] });
+      inp.addEventListener('input', () => {
+        P[sliderKey] = Number(inp.value);
+        val.textContent = inp.value;
+        if (kind === 'spec') needSpectrum = true;
+        if (kind === 'lut') needLUT = true;
+        envFull = 2;
+      });
+      row.append(name, inp, val);
+      controls.appendChild(row);
+    }
+    section.append(summary, controls);
+    categoryElements.push(section);
+    section.addEventListener('toggle', () => {
+      if (section.open) for (const other of categoryElements) if (other !== section) other.open = false;
+    });
+    panel.appendChild(section);
+  }
+  const resolutionRow = document.createElement('label');
+  resolutionRow.className = 'resolution-row';
+  const resolutionName = document.createElement('span');
+  resolutionName.textContent = 'Resolution scale';
+  const panelQuality = document.createElement('select');
+  panelQuality.setAttribute('aria-label', 'Rendering resolution scale');
+  const mobileQuality = document.getElementById('mobile-quality');
+  panelQuality.innerHTML = mobileQuality.innerHTML;
+  resolutionRow.append(resolutionName, panelQuality);
+  graphicsControls.appendChild(resolutionRow);
+  function setResolution(value) {
+    const scale = Number(value);
+    if (![0.65, 1, 1.5, 2].includes(scale)) return;
+    renderScale = scale;
+    mobileQuality.value = String(scale);
+    panelQuality.value = String(scale);
+  }
+  mobileQuality.addEventListener('change', () => setResolution(mobileQuality.value));
+  panelQuality.addEventListener('change', () => setResolution(panelQuality.value));
+  const initialScale = Number(qs.get('scale'));
+  if ([0.65, 1, 1.5, 2].includes(initialScale)) setResolution(initialScale);
+  if (qs.get('ui') === '0') {
+    document.getElementById('hud').style.display = 'none';
+    panel.classList.add('hidden');
+  }
+
+  if (touchEnabled) {
+    const pad = document.getElementById('touch-stick');
+    const knob = document.getElementById('touch-knob');
+    const boost = document.getElementById('mobile-boost');
+    const upButton = document.getElementById('mobile-up');
+    const downButton = document.getElementById('mobile-down');
+    let stickPointer = null;
+    let lookPointer = null, lookX = 0, lookY = 0;
+    const verticalHeld = { up:false, down:false };
+    function stopStick() {
+      stickPointer = null;
+      touch.fwd = touch.str = 0;
+      knob.style.transform = 'translate(0px,0px)';
+    }
+    function moveStick(e) {
+      const r = pad.getBoundingClientRect();
+      let x = (e.clientX - r.left - r.width / 2) / (r.width * 0.38);
+      let y = (e.clientY - r.top - r.height / 2) / (r.height * 0.38);
+      const length = Math.hypot(x, y);
+      if (length > 1) { x /= length; y /= length; }
+      if (length < 0.12) x = y = 0;
+      knob.style.transform = 'translate(' + (x*r.width*0.27).toFixed(1) + 'px,' + (y*r.height*0.27).toFixed(1) + 'px)';
+      touch.fwd = -y;
+      touch.str = x;
+    }
+    pad.addEventListener('pointerdown', (e) => {
+      if (stickPointer !== null) return;
+      e.preventDefault();
+      stickPointer = e.pointerId;
+      pad.setPointerCapture(e.pointerId);
+      moveStick(e);
+    });
+    pad.addEventListener('pointermove', (e) => {
+      if (stickPointer === e.pointerId) { e.preventDefault(); moveStick(e); }
+    });
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      pad.addEventListener(event, (e) => { if (stickPointer === e.pointerId) stopStick(); });
+    }
+    canvas.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' || lookPointer !== null) return;
+      e.preventDefault();
+      lookPointer = e.pointerId;
+      lookX = e.clientX; lookY = e.clientY;
+      canvas.setPointerCapture(e.pointerId);
+    });
+    canvas.addEventListener('pointermove', (e) => {
+      if (e.pointerId !== lookPointer) return;
+      e.preventDefault();
+      const dx = e.clientX - lookX, dy = e.clientY - lookY;
+      lookX = e.clientX; lookY = e.clientY;
+      cam.yaw += dx * 0.0038;
+      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - dy * 0.0038));
+    });
+    for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+      canvas.addEventListener(event, (e) => { if (e.pointerId === lookPointer) lookPointer = null; });
+    }
+    function bindVertical(button, key) {
+      let active = null;
+      const sync = () => { touch.up = Number(verticalHeld.up) - Number(verticalHeld.down); };
+      button.addEventListener('pointerdown', (e) => {
+        if (active !== null) return;
+        e.preventDefault();
+        active = e.pointerId;
+        verticalHeld[key] = true;
+        button.classList.add('down');
+        button.setPointerCapture(e.pointerId);
+        sync();
+      });
+      for (const event of ['pointerup','pointercancel','lostpointercapture']) {
+        button.addEventListener(event, (e) => {
+          if (active !== e.pointerId) return;
+          active = null; verticalHeld[key] = false;
+          button.classList.remove('down'); sync();
+        });
+      }
+    }
+    bindVertical(upButton, 'up');
+    bindVertical(downButton, 'down');
+    boost.addEventListener('click', () => {
+      touch.boost = !touch.boost;
+      boost.classList.toggle('active', touch.boost);
+      boost.setAttribute('aria-pressed', String(touch.boost));
+    });
+    document.getElementById('mobile-settings').addEventListener('click', togglePanel);
+    document.getElementById('mobile-fullscreen').addEventListener('click', () => {
+      if (document.fullscreenElement) {
+        document.exitFullscreen?.().catch(() => {});
+      } else {
+        document.documentElement.requestFullscreen?.().catch(() => {});
+      }
+    });
+    function resetTouch() {
+      stopStick(); lookPointer = null;
+      verticalHeld.up = verticalHeld.down = false;
+      touch.up = 0;
+      upButton.classList.remove('down');
+      downButton.classList.remove('down');
+    }
+    addEventListener('blur', resetTouch);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) resetTouch(); });
+  }
 
   const hudFps = document.getElementById('fps');
 
