@@ -13,12 +13,17 @@ Open **`ocean.html`** or **`ocean.min.html`** directly in recent Chrome on a com
 - **Settings:** open a collapsible accordion with Wind, Waves, Water, Sky & Atmosphere, and Graphics & Performance.
 - **Resolution:** choose 0.65×, 1×, 1.5× or 2× from the toolbar or Graphics & Performance; both stay in sync.
 - **Fullscreen:** use the fullscreen button when the browser supports it.
+- **Anti-aliasing:** 4× MSAA (original default), or off (1×) for lower screen-target memory/work with more edge aliasing.
+- **Frame-rate cap:** Unlimited (original default), 60 or 30 FPS.
+- **Measure 15 seconds:** record a repeatable sample and download its JSON report under Graphics & Performance. GPU stage timing is optional and reloads the page with the current scene/settings. Warm up before measuring; a 15-second sample is not a thermal stability test.
 
 Touch controls are shown on coarse-pointer devices. Append `?touch=1` to force them on or `?touch=0` to force them off. Append `?scale=0.65` to start at a lower render resolution. On mobile, scale 1× uses CSS pixel dimensions (rather than the usually higher device-pixel-ratio rendering size); on desktop it uses native device-pixel-ratio dimensions. Explicit `?w=` / `?h=` settings still override dimensions.
 
 Desktop WASD, mouse look, H for settings, Shift boost, and Space/E/Q/C for altitude continue to work.
 
-**Testing:** JavaScript syntax and standalone bundle assembly were checked. Real WebGPU rendering, sustained frame rate, touch interaction and GPU compatibility still require a browser/device test.
+See [the mobile audit](docs/MOBILE_AUDIT.md) for changes, resource/work analysis, browser test limits and the Galaxy S25+ checklist. The supplied phone screenshot is not a sustained benchmark; this change makes no claim of stable 60 FPS on Android.
+
+Run `npm ci`, `npm run build`, `npm test` and `npm run check:build` to verify both standalone pages match source. Browser tooling is optional and documented in the audit. Native Android presentation, physical touch and sustained performance still require phone testing.
 
 ## Original project documentation
 
@@ -36,7 +41,7 @@ A real-time ocean renderer written from scratch on WebGPU, with no engine or ren
 
 You need a recent Chrome with WebGPU and a reasonably capable GPU. On a laptop, force Chrome onto the dedicated GPU in the Windows graphics settings, or it will fall back to the integrated one.
 
-Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified (61 KB instead of 102 KB). Both are self-contained and work from `file://`.
+Open `ocean.html` directly in the browser. `ocean.min.html` is the same page minified. Build sizes change as controls and diagnostics evolve. Both are self-contained and work from `file://`.
 
 To run from source:
 
@@ -89,13 +94,13 @@ Cloud noise octaves are filtered by pixel footprint, and silhouettes are anti-al
 
 ### Post-processing
 
-The scene renders in HDR with 4x MSAA. Post-processing adds an 8-level bloom, AgX tone mapping, a slight white balance shift, and dithering.
+The scene renders in HDR with 4x MSAA. Post-processing adds up to 8 levels of bloom (fewer for very small targets), AgX tone mapping, a slight white balance shift, and dithering.
 
 ## Performance
 
 At 2560 by 1440 on an RTX 5070 Ti, the GPU takes about 6 to 8 ms per frame, measured while other programs were also using the GPU. The HUD shows FPS and GPU time when the browser supports `timestamp-query`.
 
-The per-frame code reuses preallocated typed arrays and descriptors, so the garbage collector has almost nothing to do. The only recurring allocations are the objects WebGPU itself requires, such as the swap-chain view and command buffers.
+The renderer reuses uniform arrays and most descriptors. Resizing or switching MSAA rebuilds screen targets; recording and optional detailed timing add diagnostic allocations. WebGPU also requires recurring swap-chain views and command buffers.
 
 ## Known limitations
 

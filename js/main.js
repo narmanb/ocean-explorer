@@ -1,7 +1,8 @@
 // WebGPU ocean — custom renderer.
-// FFT ocean (5 cascades) + CDLOD surface mesh + physically based sky + HDR post.
-// All per-frame data lives in preallocated typed arrays / descriptors (no per-frame garbage
-// apart from the unavoidable swap-chain view and command buffer objects).
+// FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post.
+// Normal frames reuse uniform arrays and most descriptors. Optional diagnostics collect
+// samples; WebGPU swap-chain views and command buffers are necessarily transient.
+import { targetSize, bloomLevels, summarizeSamples } from './runtime.js';
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
@@ -11,8 +12,6 @@ import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
 const D2R = Math.PI / 180;
-const GU = GPUBufferUsage;
-const TU = GPUTextureUsage;
 
 // ----------------------------------------------------------------------------------------
 // Tunable parameters (UI panel edits these)
@@ -47,7 +46,7 @@ function fail(msg) {
 }
 function log(msg) {
   console.log(msg);
-  try { fetch('/__log', { method: 'POST', body: String(msg) }).catch(() => {}); } catch (e) { /* offline */ }
+  try { if (location.protocol !== 'file:') fetch('/__log', { method: 'POST', body: String(msg) }).catch(() => {}); } catch (e) { /* offline */ }
 }
 
 // ----------------------------------------------------------------------------------------
@@ -65,14 +64,25 @@ function mat4Mul(out, a, b) {
 
 async function main() {
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
+  const GU = GPUBufferUsage, TU = GPUTextureUsage;
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) fail('No WebGPU adapter found.');
   const hasTS = adapter.features.has('timestamp-query');
   const device = await adapter.requestDevice({
     requiredFeatures: hasTS ? ['timestamp-query'] : [],
   });
-  device.lost.then((i) => log('device lost: ' + i.message));
-  device.onuncapturederror = (e) => log('GPU error: ' + e.error.message);
+  let stopped = false;
+  function stopRenderer(message) {
+    if (stopped) return;
+    stopped = true;
+    const el = document.getElementById('err');
+    el.style.display = 'block';
+    el.textContent = message + '\nReload the page to try again.';
+    document.getElementById('fps').textContent = 'Rendering stopped';
+    log(message);
+  }
+  device.lost.then((i) => stopRenderer('GPU device lost: ' + i.message));
+  device.onuncapturederror = (e) => stopRenderer('GPU error: ' + e.error.message);
 
   const canvas = document.getElementById('c');
   const touchEnabled = qs.get('touch') === '1' ||
@@ -244,16 +254,25 @@ async function main() {
   const bgCubeMips = [];
   for (let m = 1; m < ENV_MIPS; m++) bgCubeMips.push(bg(cubeMipPipe, [lvl(envTex, m - 1), lvl(envTex, m)], 'cubemip' + m));
 
+  // The cube base refreshes one face per frame; unchanged faces already have valid mips.
+  const bgCubeFaceMips = Array.from({ length: 6 }, (_, face) => {
+    const faceView = (m) => envTex.createView({ dimension: '2d-array', baseMipLevel: m,
+      mipLevelCount: 1, baseArrayLayer: face, arrayLayerCount: 1 });
+    return Array.from({ length: ENV_MIPS - 1 }, (_, i) =>
+      bg(cubeMipPipe, [faceView(i), faceView(i + 1)], 'cubemip face ' + face));
+  });
+
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
-  const MSAA = 4;
+  let MSAA = qs.get('aa') === '1' ? 1 : 4;
+  let fpsLimit = [30, 60].includes(Number(qs.get('fps'))) ? Number(qs.get('fps')) : 0;
   const HDR = 'rgba16float';
   const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
     shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
   ]);
-  const oceanPipe = await device.createRenderPipelineAsync({
+  const oceanDesc = {
     label: 'ocean', layout: 'auto',
     vertex: {
       module: oceanMod, entryPoint: 'vs',
@@ -263,15 +282,24 @@ async function main() {
     primitive: { topology: 'triangle-list', cullMode: 'none' },
     depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     multisample: { count: MSAA },
-  });
-  const skyPipe = await device.createRenderPipelineAsync({
+  };
+  const skyDesc = {
     label: 'sky', layout: 'auto',
     vertex: { module: skyMod, entryPoint: 'vs' },
     fragment: { module: skyMod, entryPoint: 'fs', targets: [{ format: HDR }] },
     primitive: { topology: 'triangle-list' },
     depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
-  });
+  };
+  const pipelinePairs = new Map();
+  async function scenePipelines(samples) {
+    if (!pipelinePairs.has(samples)) pipelinePairs.set(samples, Promise.all([
+      device.createRenderPipelineAsync({ ...oceanDesc, multisample: { count: samples } }),
+      device.createRenderPipelineAsync({ ...skyDesc, multisample: { count: samples } }),
+    ]));
+    return pipelinePairs.get(samples);
+  }
+  let [oceanPipe, skyPipe] = await scenePipelines(MSAA);
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -291,10 +319,12 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
+  const oceanEntries = (i) => [{ buffer: frameUBO }, transView, skyView, sampClamp,
     fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
-  const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+    fullArr(foamW[i]), { buffer: sunVisBuf }];
+  let bgOcean = [0, 1].map((i) => bg(oceanPipe, oceanEntries(i), 'ocean' + i));
+  let bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+
 
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
@@ -343,7 +373,7 @@ async function main() {
   const bloomUBOs = [];
   for (let i = 0; i < BLOOM_LEVELS * 2; i++) bloomUBOs.push(mkBuf(16, GU.UNIFORM | GU.COPY_DST, 'bloom ubo'));
 
-  let W = 0, H = 0;
+  let W = 0, H = 0, targetSamples = 0, bloomCount = BLOOM_LEVELS;
   let colorMS, depthMS, hdrTex, bloomTex;
   const mainPass = {
     colorAttachments: [{ view: null, resolveTarget: null, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'discard' }],
@@ -355,29 +385,34 @@ async function main() {
   };
   let downPasses = [], upPasses = [], downBGs = [], upBGs = [], bgComp = null;
 
+  const targetDimensions = [0, 0];
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = (touchEnabled ? 1 : (window.devicePixelRatio || 1)) * renderScale;
-    const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
-    if (w === W && h === H) return;
+    const dpr = touchEnabled ? 1 : (window.devicePixelRatio || 1);
+    const [w, h] = targetSize(canvas.clientWidth, canvas.clientHeight, dpr, renderScale,
+      device.limits.maxTextureDimension2D, fw, fh, targetDimensions);
+    if (w === W && h === H && targetSamples === MSAA) return;
+    cancelRecording('Measurement cancelled: render target changed.');
+    targetSamples = MSAA;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
     for (const t of [colorMS, depthMS, hdrTex, bloomTex]) t && t.destroy();
-    colorMS = device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
+    colorMS = MSAA === 1 ? null : device.createTexture({ size: [W, H], format: HDR, sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     depthMS = device.createTexture({ size: [W, H], format: 'depth32float', sampleCount: MSAA, usage: TU.RENDER_ATTACHMENT });
     hdrTex = device.createTexture({ size: [W, H], format: HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
     const bw = Math.max(1, W >> 1), bh = Math.max(1, H >> 1);
-    bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: BLOOM_LEVELS, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    mainPass.colorAttachments[0].view = colorMS.createView();
-    mainPass.colorAttachments[0].resolveTarget = hdrTex.createView();
+    bloomCount = bloomLevels(W, H);
+    bloomTex = device.createTexture({ size: [bw, bh], format: HDR, mipLevelCount: bloomCount, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
+    mainPass.colorAttachments[0].view = (colorMS || hdrTex).createView();
+    mainPass.colorAttachments[0].resolveTarget = colorMS ? hdrTex.createView() : undefined;
+    mainPass.colorAttachments[0].storeOp = colorMS ? 'discard' : 'store';
     mainPass.depthStencilAttachment.view = depthMS.createView();
     const hdrView = hdrTex.createView();
     const bv = [];
-    for (let m = 0; m < BLOOM_LEVELS; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
+    for (let m = 0; m < bloomCount; m++) bv.push(bloomTex.createView({ baseMipLevel: m, mipLevelCount: 1 }));
     downPasses = []; upPasses = []; downBGs = []; upBGs = [];
     const tmp = new Float32Array(4);
-    for (let m = 0; m < BLOOM_LEVELS; m++) {
+    for (let m = 0; m < bloomCount; m++) {
       const srcW = m === 0 ? W : Math.max(1, bw >> (m - 1));
       const srcH = m === 0 ? H : Math.max(1, bh >> (m - 1));
       tmp[0] = 1 / srcW; tmp[1] = 1 / srcH; tmp[2] = m === 0 ? 1 : 0; tmp[3] = 0;
@@ -385,7 +420,7 @@ async function main() {
       downBGs.push(bg(downPipe, [m === 0 ? hdrView : bv[m - 1], linSamp, { buffer: bloomUBOs[m] }]));
       downPasses.push({ colorAttachments: [{ view: bv[m], clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
     }
-    for (let m = BLOOM_LEVELS - 1; m > 0; m--) {
+    for (let m = bloomCount - 1; m > 0; m--) {
       const sw = Math.max(1, bw >> m), sh = Math.max(1, bh >> m);
       tmp[0] = 1 / sw; tmp[1] = 1 / sh; tmp[2] = 1.0; tmp[3] = 1.0;
       const ubo = bloomUBOs[BLOOM_LEVELS + m];
@@ -399,24 +434,43 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // GPU timing
   // --------------------------------------------------------------------------------------
-  let tsQuery = null, tsResolve = null, tsRead = null, tsPending = false, gpuMs = 0;
-  let firstPassTS = undefined;
+  const profile = qs.get('profile') === '1';
+  const stageNames = ['waves', 'foam', 'atmosphereReflections', 'scene', 'post'];
+  const queryCount = profile ? 10 : 2;
+  let tsQuery = null, tsResolve = null, tsRead = null, tsPending = false, gpuMs = null;
+  const stageMs = Object.create(null);
+  const stageDescs = [];
+  let firstPassTS;
   if (hasTS) {
-    tsQuery = device.createQuerySet({ type: 'timestamp', count: 2 });
-    tsResolve = mkBuf(16, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
-    tsRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'ts read');
+    tsQuery = device.createQuerySet({ type: 'timestamp', count: queryCount });
+    tsResolve = mkBuf(queryCount * 8, GU.QUERY_RESOLVE | GU.COPY_SRC, 'ts resolve');
+    tsRead = mkBuf(queryCount * 8, GU.MAP_READ | GU.COPY_DST, 'ts read');
     firstPassTS = { querySet: tsQuery, beginningOfPassWriteIndex: 0 };
-    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: 1 };
+    compPass.timestampWrites = { querySet: tsQuery, endOfPassWriteIndex: queryCount - 1 };
+    if (profile) {
+      for (let i = 0; i < stageNames.length; i++) stageDescs.push({
+        timestampWrites: { querySet: tsQuery, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 },
+      });
+      mainPass.timestampWrites = stageDescs[3].timestampWrites;
+    }
   }
   const computeDesc = { timestampWrites: firstPassTS };
   const onTsMapped = () => {
     const t = new BigUint64Array(tsRead.getMappedRange());
-    const ms = Number(t[1] - t[0]) / 1e6;
-    if (ms > 0 && ms < 1000) gpuMs = gpuMs ? gpuMs * 0.8 + ms * 0.2 : ms;
-    tsRead.unmap();
-    tsPending = false;
+    const ms = Number(t[queryCount - 1] - t[0]) / 1e6;
+    if (ms > 0 && ms < 10000) {
+      gpuMs = gpuMs === null ? ms : gpuMs * 0.8 + ms * 0.2;
+      if (profile) for (let i = 0; i < stageNames.length; i++)
+        stageMs[stageNames[i]] = Number(t[i * 2 + 1] - t[i * 2]) / 1e6;
+      if (recording && tsRecording === recording) {
+        recording.gpu.push(ms);
+        if (profile) for (const name of stageNames) recording.stages[name].push(stageMs[name]);
+      }
+    }
+    tsRead.unmap(); tsPending = false;
   };
   const onTsFail = () => { tsPending = false; };
+  let tsRecording = null;
 
   // --------------------------------------------------------------------------------------
   // Uniform data
@@ -454,7 +508,13 @@ async function main() {
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
   const touch = { fwd:0, str:0, up:0, boost:false };
-  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
+  const editing = (target) => target?.closest?.('input, select, button, summary, [contenteditable]');
+  addEventListener('keydown', (e) => {
+    if (editing(e.target)) return;
+    keys[e.code] = true;
+    if (e.code === 'KeyH' && !e.repeat) togglePanel();
+    if (['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
   canvas.addEventListener('click', () => { if (!touchEnabled && document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
@@ -468,7 +528,7 @@ async function main() {
       cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
     }
   });
-  addEventListener('wheel', (e) => {
+  canvas.addEventListener('wheel', (e) => {
     cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
   }, { passive: true });
 
@@ -608,7 +668,11 @@ async function main() {
   // UI
   // --------------------------------------------------------------------------------------
   const panel = document.getElementById('panel');
-  function togglePanel() { panel.classList.toggle('hidden'); }
+  function togglePanel() {
+    panel.classList.toggle('hidden');
+    for (const k in keys) keys[k] = false;
+    if (!panel.classList.contains('hidden')) document.exitPointerLock?.();
+  }
   const SLIDERS = [
     ['windSpeed', 'Wind speed (m/s)', 2, 20, 0.1, 'spec'],
     ['windDir', 'Wind direction (deg)', 0, 360, 1, 'spec'],
@@ -628,7 +692,10 @@ async function main() {
     ['bloom', 'Bloom', 0, 0.3, 0.001, ''],
   ];
   // Apply URL overrides before creating slider values.
-  for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
+  for (const k of Object.keys(P)) if (qs.has(k)) {
+    const v = Number(qs.get(k)), limits = SLIDERS.find((s) => s[0] === k);
+    if (Number.isFinite(v)) P[k] = limits ? Math.max(limits[2], Math.min(limits[3], v)) : v;
+  }
   const panelHeading = document.createElement('div');
   panelHeading.className = 'panel-heading';
   const panelTitle = document.createElement('span');
@@ -669,11 +736,12 @@ async function main() {
       const inp = document.createElement('input');
       Object.assign(inp, { type:'range', min, max, step, value:P[sliderKey] });
       inp.addEventListener('input', () => {
+        cancelRecording('Measurement cancelled: environment changed.');
         P[sliderKey] = Number(inp.value);
         val.textContent = inp.value;
         if (kind === 'spec') needSpectrum = true;
         if (kind === 'lut') needLUT = true;
-        envFull = 2;
+        if (['sunElev','sunAzim','haze','clouds','veil','turbidity'].includes(sliderKey)) envFull = 2;
       });
       row.append(name, inp, val);
       controls.appendChild(row);
@@ -684,6 +752,14 @@ async function main() {
       if (section.open) for (const other of categoryElements) if (other !== section) other.open = false;
     });
     panel.appendChild(section);
+  }
+  let recording = null, lastReport = null;
+  let measureStatus;
+  function cancelRecording(reason) {
+    if (!recording) return;
+    recording = null;
+    measureButton.disabled = false;
+    measureStatus.textContent = reason;
   }
   const resolutionRow = document.createElement('label');
   resolutionRow.className = 'resolution-row';
@@ -698,17 +774,78 @@ async function main() {
   function setResolution(value) {
     const scale = Number(value);
     if (![0.65, 1, 1.5, 2].includes(scale)) return;
+    cancelRecording('Measurement cancelled: resolution changed.');
     renderScale = scale;
     mobileQuality.value = String(scale);
     panelQuality.value = String(scale);
   }
   mobileQuality.addEventListener('change', () => setResolution(mobileQuality.value));
   panelQuality.addEventListener('change', () => setResolution(panelQuality.value));
+  function addSelect(label, options, value, onChange) {
+    const row = document.createElement('label'); row.className = 'resolution-row';
+    const name = document.createElement('span'); name.textContent = label;
+    const select = document.createElement('select'); select.setAttribute('aria-label', label);
+    for (const [v, text] of options) select.add(new Option(text, v));
+    select.value = String(value);
+    select.addEventListener('change', () => { cancelRecording('Measurement cancelled: graphics changed.'); onChange(select); });
+    row.append(name, select); graphicsControls.append(row); return select;
+  }
+  addSelect('Anti-aliasing', [[4, '4× MSAA (default)'], [1, 'Off (1×)']], MSAA, async (select) => {
+    select.disabled = true;
+    try {
+      const samples = Number(select.value);
+      [oceanPipe, skyPipe] = await scenePipelines(samples);
+      bgOcean = [0, 1].map((i) => bg(oceanPipe, oceanEntries(i), 'ocean' + i));
+      bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
+      cancelRecording('Measurement cancelled: anti-aliasing changed.');
+      MSAA = samples; resize();
+    } catch (e) { stopRenderer('Anti-aliasing pipeline failed: ' + e.message); }
+    finally { select.disabled = false; }
+  });
+  addSelect('Frame-rate cap', [[0, 'Unlimited'], [60, '60 FPS'], [30, '30 FPS']], fpsLimit,
+    (select) => { fpsLimit = Number(select.value); nextFrameAt = 0; });
+  const measureButton = document.createElement('button');
+  measureButton.type = 'button'; measureButton.textContent = 'Measure 15 seconds';
+  measureStatus = document.createElement('div'); measureStatus.className = 'measure-status';
+  measureStatus.setAttribute('aria-live', 'polite');
+  const downloadButton = document.createElement('button'); downloadButton.type = 'button';
+  downloadButton.textContent = 'Download last report'; downloadButton.disabled = true;
+  measureButton.addEventListener('click', () => {
+    if (stopped) return;
+    recording = { start: null, frames: [], gpu: [],
+      stages: Object.fromEntries(stageNames.map((name) => [name, []])) };
+    measureButton.disabled = true; measureStatus.textContent = 'Measuring… explore for 15 seconds.';
+  });
+  downloadButton.addEventListener('click', () => {
+    const url = URL.createObjectURL(new Blob([JSON.stringify(lastReport, null, 2)], { type: 'application/json' }));
+    const a = document.createElement('a'); a.href = url; a.download = 'ocean-measurement.json'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
+  const profileButton = document.createElement('button'); profileButton.type = 'button';
+  profileButton.textContent = `GPU stage timing: ${profile ? 'on' : 'off'} (reload)`;
+  profileButton.addEventListener('click', () => {
+    const url = new URL(location.href);
+    url.searchParams.set('profile', profile ? '0' : '1');
+    url.searchParams.set('scale', renderScale); url.searchParams.set('aa', MSAA);
+    url.searchParams.set('fps', fpsLimit);
+    url.searchParams.set('cam', [cam.x, cam.y, cam.z, cam.yaw / D2R, cam.pitch / D2R].join(','));
+    for (const [key, value] of Object.entries(P)) url.searchParams.set(key, value);
+    location.href = url.href;
+  });
+  graphicsControls.append(profileButton, measureButton, downloadButton, measureStatus);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      cancelRecording('Measurement cancelled: page was hidden.');
+      for (const k in keys) keys[k] = false;
+    }
+    last = performance.now(); nextFrameAt = 0;
+  });
   const initialScale = Number(qs.get('scale'));
   if ([0.65, 1, 1.5, 2].includes(initialScale)) setResolution(initialScale);
   if (qs.get('ui') === '0') {
     document.getElementById('hud').style.display = 'none';
     panel.classList.add('hidden');
+    document.getElementById('touch-ui').style.display = 'none';
   }
 
   if (touchEnabled) {
@@ -826,7 +963,8 @@ async function main() {
   const fixedDt = shotName ? 1 / 60 : 0;
   let last = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
-  let shooting = false;
+  let shooting = false, nextFrameAt = 0;
+  let skyHeight = NaN, skySun = NaN, skyHaze = NaN;
 
   function encodeSim(cp) {
     cp.setPipeline(evolvePipe);
@@ -844,7 +982,9 @@ async function main() {
       cp.setBindGroup(0, bgSimMips[m - 1]);
       cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), C);
     }
-    // foam clipmaps
+  }
+
+  function encodeFoam(cp) {
     foamCur = 1 - foamCur;
     cp.setPipeline(foamUpdPipe);
     cp.setBindGroup(0, bgFoamUpd[foamCur]);
@@ -879,17 +1019,44 @@ async function main() {
   }
 
   function frame(now) {
-    if (shooting) return;  // paused while a screenshot is read back
+    if (shooting || stopped) return;  // paused while a screenshot is read back
     requestAnimationFrame(frame);
+    if (document.hidden) return;
+    if (!fixedDt && fpsLimit) {
+      if (now < nextFrameAt - 0.5) return;
+      const step = 1000 / fpsLimit;
+      if (!nextFrameAt) nextFrameAt = now;
+      nextFrameAt = Math.max(nextFrameAt + step, now);
+    }
     resize();
-    let dt = Math.min(0.1, (now - last) / 1000);
+    const elapsedMs = now - last;
+    let dt = Math.min(0.1, elapsedMs / 1000);
     last = now;
-    fpsAcc += dt; fpsN++; fpsT += dt;
+    fpsAcc += elapsedMs / 1000; fpsN++; fpsT += elapsedMs / 1000;
     if (fpsT > 0.5) {
       const fps = fpsN / fpsAcc;
       hudFps.textContent = `${fps.toFixed(0)} fps  ${(1000 / fps).toFixed(2)} ms` +
-        (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') + `  |  ${nodeCount} nodes  ${W}x${H}`;
+        (hasTS ? `  |  GPU ${gpuMs === null ? 'pending' : gpuMs.toFixed(2) + ' ms'}` : '  |  GPU timing unavailable') + `  |  ${nodeCount} nodes  ${W}x${H}`;
       fpsAcc = 0; fpsN = 0; fpsT = 0;
+    }
+    if (recording && recording.start === null) {
+      recording.start = now;
+    } else if (recording) {
+      recording.frames.push(elapsedMs);
+      if (now - recording.start >= 15000) {
+        const info = adapter.info;
+        lastReport = {
+          createdAt: new Date().toISOString(), durationMs: now - recording.start,
+          userAgent: navigator.userAgent,
+          adapter: info ? { vendor: info.vendor, architecture: info.architecture, description: info.description } : null,
+          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P } },
+          frames: summarizeSamples(recording.frames), gpu: summarizeSamples(recording.gpu),
+          gpuStages: profile && hasTS ? Object.fromEntries(stageNames.map((name) => [name, summarizeSamples(recording.stages[name])])) : null,
+          note: 'GPU samples are asynchronous, every eighth rendered frame. Stage profiling adds pass boundaries. This is a 15-second sample, not a thermal stability test.',
+        };
+        measureStatus.textContent = `${lastReport.frames.fps.toFixed(1)} FPS · p95 ${lastReport.frames.p95Ms.toFixed(1)} ms`;
+        measureButton.disabled = false; downloadButton.disabled = false; recording = null;
+      }
     }
     if (fixedDt) dt = fixedDt;
     updateCamera(dt);
@@ -906,7 +1073,7 @@ async function main() {
     if (nodeCount) device.queue.writeBuffer(instBuf, 0, instData, 0, nodeCount * 4);
 
     const enc = device.createCommandEncoder();
-    const cp = enc.beginComputePass(computeDesc);
+    let cp = enc.beginComputePass(profile ? stageDescs[0] : computeDesc);
     if (needSpectrum) {
       cp.setPipeline(initPipe);
       cp.setBindGroup(0, bgInit);
@@ -925,12 +1092,20 @@ async function main() {
       needLUT = false;
     }
     encodeSim(cp);
+    if (profile) { cp.end(); cp = enc.beginComputePass(stageDescs[1]); }
+    encodeFoam(cp);
+    if (profile) { cp.end(); cp = enc.beginComputePass(stageDescs[2]); }
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
-    cp.setPipeline(skyViewPipe);
-    cp.setBindGroup(0, bgSkyView);
-    cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+    // SKYVIEW_LUT depends only on clamped altitude, sun elevation, haze and its LUTs.
+    // Camera yaw/position, clouds and time are applied by the sky/reflection shaders later.
+    if (skyHeight !== frameF[73] || skySun !== frameF[33] || skyHaze !== frameF[72]) {
+      cp.setPipeline(skyViewPipe);
+      cp.setBindGroup(0, bgSkyView);
+      cp.dispatchWorkgroups(Math.ceil(SKY_W / 8), Math.ceil(SKY_H / 8));
+      skyHeight = frameF[73]; skySun = frameF[33]; skyHaze = frameF[72];
+    }
     cp.setPipeline(sunVisPipe);
     cp.setBindGroup(0, bgSunVis);
     cp.dispatchWorkgroups(1);
@@ -938,12 +1113,13 @@ async function main() {
     cp.setBindGroup(0, bgEnv);
     // one cube face per frame (all six on start-up / after parameter changes)
     cp.dispatchWorkgroups(ENV_SIZE / 8, ENV_SIZE / 8, envFull > 0 ? 6 : 1);
-    if (envFull > 0) envFull--;
+    const fullCube = envFull > 0;
+    if (fullCube) envFull--;
     cp.setPipeline(cubeMipPipe);
     for (let m = 1; m < ENV_MIPS; m++) {
       const s = Math.max(1, ENV_SIZE >> m);
-      cp.setBindGroup(0, bgCubeMips[m - 1]);
-      cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), 6);
+      cp.setBindGroup(0, fullCube ? bgCubeMips[m - 1] : bgCubeFaceMips[frameIndex % 6][m - 1]);
+      cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), fullCube ? 6 : 1);
     }
     cp.end();
 
@@ -960,14 +1136,16 @@ async function main() {
     rp.draw(3);
     rp.end();
 
-    for (let m = 0; m < BLOOM_LEVELS; m++) {
+    for (let m = 0; m < (P.bloom > 0 ? bloomCount : 0); m++) {
+      downPasses[m].timestampWrites = profile && hasTS && m === 0 ?
+        { querySet: tsQuery, beginningOfPassWriteIndex: 8 } : undefined;
       const p = enc.beginRenderPass(downPasses[m]);
       p.setPipeline(downPipe);
       p.setBindGroup(0, downBGs[m]);
       p.draw(3);
       p.end();
     }
-    for (let i = 0; i < upPasses.length; i++) {
+    for (let i = 0; i < (P.bloom > 0 ? upPasses.length : 0); i++) {
       const p = enc.beginRenderPass(upPasses[i]);
       p.setPipeline(upPipe);
       p.setBindGroup(0, upBGs[i]);
@@ -976,10 +1154,12 @@ async function main() {
     }
 
     compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
-    compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 0;
+    compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 1 / bloomCount;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();
+    if (profile && hasTS) compPass.timestampWrites = P.bloom > 0 ?
+      { querySet: tsQuery, endOfPassWriteIndex: 9 } : stageDescs[4].timestampWrites;
     const pc = enc.beginRenderPass(compPass);
     pc.setPipeline(compPipe);
     pc.setBindGroup(0, bgComp);
@@ -993,8 +1173,8 @@ async function main() {
     }
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
-      enc.resolveQuerySet(tsQuery, 0, 2, tsResolve, 0);
-      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, 16);
+      enc.resolveQuerySet(tsQuery, 0, queryCount, tsResolve, 0);
+      enc.copyBufferToBuffer(tsResolve, 0, tsRead, 0, queryCount * 8);
       doTs = true;
     }
     let readBuf = null;
@@ -1003,12 +1183,12 @@ async function main() {
       const bpr = Math.ceil(W * 4 / 256) * 256;
       readBuf = device.createBuffer({ size: bpr * H, usage: GU.MAP_READ | GU.COPY_DST });
       enc.copyTextureToBuffer({ texture: swapTex }, { buffer: readBuf, bytesPerRow: bpr }, [W, H]);
-      saveShot(readBuf, bpr);
+
     }
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
-    if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
+    if (doTs) { tsPending = true; tsRecording = recording; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);
   }
 
@@ -1033,7 +1213,7 @@ async function main() {
     const blob = await oc.convertToBlob({ type: 'image/png' });
     const nm = shotSeq > 1 ? shotName.replace('.png', `_${shotIdx}.png`) : shotName;
     await fetch('/__shot?name=' + encodeURIComponent(nm), { method: 'POST', body: blob });
-    log('shot saved ' + nm + ' gpu ' + gpuMs.toFixed(2) + 'ms nodes ' + nodeCount);
+    log('shot saved ' + nm + ' gpu ' + (gpuMs === null ? 'unavailable' : gpuMs.toFixed(2) + 'ms') + ' nodes ' + nodeCount);
     shotIdx++;
     shooting = false;
     if (shotIdx < shotSeq) { requestAnimationFrame(frame); return; }
@@ -1047,4 +1227,9 @@ async function main() {
   requestAnimationFrame(frame);
 }
 
-main().catch((e) => { log('init failed: ' + (e && e.stack || e)); });
+main().catch((e) => {
+  const el = document.getElementById('err');
+  el.style.display = 'block'; el.textContent = 'Ocean initialization failed: ' + (e?.message || e);
+  document.getElementById('fps').textContent = 'Rendering stopped';
+  log('init failed: ' + (e?.stack || e));
+});

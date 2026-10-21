@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sim.js', 'js/wgsl/sky.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js'];
-const order = [...wgslModules, 'js/main.js'];
+const order = ['js/runtime.js', ...wgslModules, 'js/main.js'];
 const stripModuleSyntax = (src) => src
   .replace(/^import[\s\S]*?from\s+['"][^'"]+['"];\s*$/gm, '')                 // drop imports
   .replace(/^export\s+(const|function|async function|let|class)\s/gm, '$1 ');
@@ -20,6 +20,10 @@ const stripModuleSyntax = (src) => src
 const page = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 const SCRIPT_TAG = '<script type="module" src="js/main.js"></script>';
 const write = (name, html) => {
+  if (process.argv.includes('--check')) {
+    if (fs.readFileSync(path.join(root, name), 'utf8') !== html) throw new Error(name + ' is stale; run npm run build');
+    console.log('verified ' + name); return;
+  }
   fs.writeFileSync(path.join(root, name), html);
   console.log(`wrote ${name}`, (html.length / 1024).toFixed(0) + ' KB');
 };
@@ -52,7 +56,7 @@ function minifyTemplates(src) {
     return '`' + out + '`';
   });
 }
-let minJs = '';
+let minJs = stripModuleSyntax(fs.readFileSync(path.join(root, 'js/runtime.js'), 'utf8')) + '\n';
 for (const f of wgslModules) minJs += stripModuleSyntax(minifyTemplates(fs.readFileSync(path.join(root, f), 'utf8'))) + '\n';
 minJs += stripModuleSyntax(fs.readFileSync(path.join(root, 'js/main.js'), 'utf8'));
 
