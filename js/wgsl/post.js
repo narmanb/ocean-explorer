@@ -69,7 +69,7 @@ fn tap(uv: vec2f) -> vec3f { return textureSampleLevel(src, samp, uv, 0.0).rgb; 
 `;
 
 export const COMPOSITE = FS_TRI + /* wgsl */ `
-struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, grain
+struct P { p: vec4f, q: vec4f };  // p: exposure, bloom, frame, vignette; q: saturation, contrast, warmth, bloom normalization
 @group(0) @binding(0) var hdr: texture_2d<f32>;
 @group(0) @binding(1) var bloom: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
@@ -108,8 +108,8 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
   let dims = vec2f(textureDimensions(hdr));
   let pc = vec2i(in.pos.xy);
   var c = textureLoad(hdr, pc, 0).rgb;
-  // the up-chain accumulates 8 blur levels
-  let b = textureSampleLevel(bloom, samp, in.uv, 0.0).rgb * (1.0 / 8.0);
+  // Normalize by the actual chain length (small targets may have fewer than 8 levels).
+  let b = textureSampleLevel(bloom, samp, in.uv, 0.0).rgb * U.q.w;
   c = mix(c, b, U.p.y);
   c *= U.p.x;
   // subtle vignette

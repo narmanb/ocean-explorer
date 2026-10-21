@@ -1,9 +1,33 @@
 <!doctype html>
 <html lang="en">
+<!--
+Ocean Explorer is based on Noniv/web-ocean. Original attribution and license:
+MIT License
+
+Copyright (c) 2026 Maksymilian Dendura
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+-->
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ocean — WebGPU</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ocean Explorer — WebGPU</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -16,7 +40,51 @@
   #panel label { display: grid; grid-template-columns: 1fr 110px 40px; gap: 6px; align-items: center; margin: 3px 0; }
   #panel input { width: 110px; accent-color: #e2a04e; }
   #panel output { text-align: right; font-variant-numeric: tabular-nums; opacity: .8; }
-  #err { position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
+  #err { z-index:100; position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
+
+  #panel { z-index:25; display:block; width:min(355px,calc(100vw - 24px)); box-sizing:border-box; max-height:calc(100dvh - 26px); overflow-y:auto; overscroll-behavior:contain; touch-action:pan-y; }
+  #panel.hidden { display:none; }
+  .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:7px; font-size:15px; font-weight:700; }
+  .panel-close { border:1px solid #ffffff55; background:#263748; border-radius:7px; color:inherit; width:30px; height:30px; cursor:pointer; }
+  .settings-category { border-top:1px solid #ffffff29; }
+  .settings-category summary { cursor:pointer; padding:12px 5px; font-size:14px; font-weight:650; list-style:none; display:flex; justify-content:space-between; align-items:center; touch-action:manipulation; }
+  .settings-category summary::-webkit-details-marker { display:none; }
+  .settings-category summary::after { content:"⌄"; color:#d4dbe4; font-size:18px; line-height:1; }
+  .settings-category[open] summary::after { content:"⌃"; }
+  .category-controls { padding:4px 3px 13px; display:grid; gap:8px; }
+  #panel .category-controls label { display:grid; grid-template-columns:minmax(0,1fr) 108px 38px; align-items:center; gap:5px; margin:0; font-size:12px; }
+  #panel .category-controls input[type=range] { width:100%; min-width:0; accent-color:#e2a04e; touch-action:none; }
+  #panel .category-controls select { color:#e5e1d8; background:#253849; border:1px solid #ffffff55; border-radius:6px; padding:5px 2px; width:100%; }
+  #panel .category-controls output { text-align:right; font-variant-numeric:tabular-nums; opacity:.85; }
+  #panel .category-controls button { min-height:44px; color:inherit; background:#253849; border:1px solid #ffffff55; border-radius:7px; cursor:pointer; }
+  #panel .category-controls button:disabled { opacity:.5; cursor:default; }
+  .measure-status { font-size:12px; line-height:1.5; }
+  #panel .category-controls input[type=range] { min-height:32px; }
+  #panel .resolution-row { grid-template-columns:minmax(0,1fr) 152px !important; }
+  #touch-ui { display:none; position:fixed; inset:0; z-index:12; color:#f7fbff; font:600 12px system-ui,sans-serif; pointer-events:none; -webkit-user-select:none; user-select:none; }
+  body.mobile-ui, body.mobile-ui #c { touch-action:none; overscroll-behavior:none; }
+  body.mobile-ui #touch-ui { display:block; }
+  #touch-ui * { box-sizing:border-box; }
+  #touch-ui button,#touch-ui select,#touch-ui .joystick { pointer-events:auto; touch-action:none; }
+  #touch-bar { position:absolute; top:max(8px,env(safe-area-inset-top)); right:max(8px,env(safe-area-inset-right)); display:flex; align-items:center; gap:6px; }
+  #touch-bar button,#touch-bar select { background:#101d29ca; color:white; border:1px solid #ffffff75; border-radius:9px; min-height:40px; padding:0 12px; font:600 13px system-ui,sans-serif; }
+  #touch-bar select { width:136px; }
+  #touch-bar button:active,#touch-actions button.down { background:#7394ae; }
+  #touch-stick { position:absolute; bottom:max(15px,env(safe-area-inset-bottom)); left:max(18px,env(safe-area-inset-left)); width:120px; height:120px; border-radius:50%; border:2px solid #ffffff70; background:#31435766; box-shadow:0 3px 24px #0004; }
+  #touch-stick::before,#touch-stick::after { content:""; position:absolute; background:#ffffff29; pointer-events:none; }
+  #touch-stick::before { width:1px;top:13%;bottom:13%;left:50%; }
+  #touch-stick::after { height:1px;left:13%;right:13%;top:50%; }
+  #touch-knob { position:absolute; left:50%;top:50%;width:49px;height:49px; margin-left:-24.5px;margin-top:-24.5px; border-radius:50%; background:#bce8ff96; border:2px solid #f4fbffc0; box-shadow:0 1px 9px #0006; transform:translate(0,0); }
+  #touch-actions { position:absolute;bottom:max(15px,env(safe-area-inset-bottom));right:max(18px,env(safe-area-inset-right));display:grid;grid-template-columns:52px 52px;gap:9px; }
+  #touch-actions button { width:52px;height:52px;border-radius:50%;border:1px solid #ffffff6b;background:#26384bc2;color:white;font:700 12px system-ui,sans-serif; }
+  #touch-actions .wide { grid-column:span 2;width:113px;height:38px;border-radius:12px; }
+  #touch-actions button.active { background:#cbeafa;color:#162737; }
+  #look-hint { position:absolute;left:50%;bottom:28px;transform:translateX(-50%);white-space:nowrap;text-shadow:0 1px 5px #000b;color:#ffffffc4;pointer-events:none; }
+  body.mobile-ui #hud { z-index:6;max-width:43vw; font-size:11px; }
+  body.mobile-ui #hud .help {display:none;}
+  body.mobile-ui #panel { top:55px;right:10px;max-height:calc(100dvh - 62px); }
+  @media(max-width:670px) { body.mobile-ui #hud{font-size:10px;max-width:35vw;} #touch-stick{width:100px;height:100px;} #look-hint{font-size:10px;bottom:8px;} #touch-bar button{padding:0 8px;} #touch-bar select{width:112px;} }
+  @media(orientation:portrait) { #look-hint{bottom:155px;} }
 </style>
 </head>
 <body>
@@ -27,6 +95,25 @@
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>
+<div id="touch-ui" aria-label="Touchscreen exploration controls">
+  <div id="touch-bar">
+    <select id="mobile-quality" aria-label="Rendering resolution">
+      <option value="0.65">Low · 0.65×</option>
+      <option value="1" selected>Medium · 1×</option>
+      <option value="1.5">High · 1.5×</option>
+      <option value="2">Ultra · 2×</option>
+    </select>
+    <button id="mobile-settings" type="button" aria-label="Settings">Settings</button>
+    <button id="mobile-fullscreen" type="button" aria-label="Toggle fullscreen">⛶</button>
+  </div>
+  <div id="touch-stick" class="joystick" aria-label="Move"><div id="touch-knob"></div></div>
+  <div id="touch-actions">
+    <button id="mobile-up" type="button">UP</button>
+    <button id="mobile-down" type="button">DOWN</button>
+    <button id="mobile-boost" type="button" class="wide" aria-pressed="false">FAST 5×</button>
+  </div>
+  <div id="look-hint">Drag the water to look around</div>
+</div>
 <script type="module" src="js/main.js"></script>
 </body>
 </html>

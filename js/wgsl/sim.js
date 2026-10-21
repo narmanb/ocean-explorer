@@ -1,4 +1,4 @@
-// FFT ocean simulation (Tessendorf) — 4 cascades of 256^2.
+// FFT ocean simulation (Tessendorf) — 6 cascades of 256^2.
 import { N, LOGN, CASCADES, NOISE_WGSL, PERIODIC_WGSL } from './common.js';
 
 const SIM_STRUCT = /* wgsl */ `
