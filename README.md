@@ -1,3 +1,27 @@
+# Ocean Explorer
+
+This fork of [Noniv/web-ocean](https://github.com/Noniv/web-ocean) adds touch exploration controls and a categorized settings panel. The renderer remains based on Maksymilian Dendura's MIT-licensed work.
+
+## Mobile controls and settings
+
+Open **`ocean.html`** or **`ocean.min.html`** directly in recent Chrome on a compatible Android device (WebGPU required). Both generated pages are self-contained and do not fetch the original project at runtime.
+
+- **Left joystick:** move forward, back and sideways.
+- **Drag the ocean:** look around.
+- **UP / DOWN:** rise and descend.
+- **FAST 5×:** toggle movement boost.
+- **Settings:** open a collapsible accordion with Wind, Waves, Water, Sky & Atmosphere, and Graphics & Performance.
+- **Resolution:** choose 0.65×, 1×, 1.5× or 2× from the toolbar or Graphics & Performance; both stay in sync.
+- **Fullscreen:** use the fullscreen button when the browser supports it.
+
+Touch controls are shown on coarse-pointer devices. Append `?touch=1` to force them on or `?touch=0` to force them off. Append `?scale=0.65` to start at a lower render resolution. On mobile, scale 1× uses CSS pixel dimensions (rather than the usually higher device-pixel-ratio rendering size); on desktop it uses native device-pixel-ratio dimensions. Explicit `?w=` / `?h=` settings still override dimensions.
+
+Desktop WASD, mouse look, H for settings, Shift boost, and Space/E/Q/C for altitude continue to work.
+
+**Testing:** JavaScript syntax and standalone bundle assembly were checked. Real WebGPU rendering, sustained frame rate, touch interaction and GPU compatibility still require a browser/device test.
+
+## Original project documentation
+
 # web-ocean
 
 A real-time ocean renderer written from scratch on WebGPU, with no engine or rendering library. It draws a sunset sea with simulated waves, whitecaps, sun glitter, and a physically based sky with clouds. You fly around it with a free camera.
