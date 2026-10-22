@@ -11,8 +11,8 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sim.js', 'js/wgsl/sky.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js'];
-const order = ['js/runtime.js', ...wgslModules, 'js/main.js'];
+const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sim.js', 'js/wgsl/sky.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js','js/wgsl/spray.js'];
+const order = ['js/runtime.js','js/storm.js', ...wgslModules, 'js/main.js'];
 const stripModuleSyntax = (src) => src
   .replace(/^import[\s\S]*?from\s+['"][^'"]+['"];\s*$/gm, '')                 // drop imports
   .replace(/^export\s+(const|function|async function|let|class)\s/gm, '$1 ');
@@ -56,7 +56,7 @@ function minifyTemplates(src) {
     return '`' + out + '`';
   });
 }
-let minJs = stripModuleSyntax(fs.readFileSync(path.join(root, 'js/runtime.js'), 'utf8')) + '\n';
+let minJs = ['js/runtime.js','js/storm.js'].map((f)=>stripModuleSyntax(fs.readFileSync(path.join(root,f),'utf8'))).join('\n')+'\n';
 for (const f of wgslModules) minJs += stripModuleSyntax(minifyTemplates(fs.readFileSync(path.join(root, f), 'utf8'))) + '\n';
 minJs += stripModuleSyntax(fs.readFileSync(path.join(root, 'js/main.js'), 'utf8'));
 

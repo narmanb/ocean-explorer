@@ -67,7 +67,7 @@ struct VSOut {
   var xz = inst.xy + g * spacing;
   // CDLOD morph towards the next coarser level
   let R = F.lodP.x * exp2(inst.w);
-  let d = distance(vec3f(xz.x, 0.0, xz.y), F.camPos.xyz);
+  let d = length(vec3f(xz-F.camPos.xz,max(abs(F.camPos.y)-F.seaP.x,0.0)));
   let mk = clamp((d - 0.8 * R) / (0.2 * R), 0.0, 1.0);
   xz -= fract(g * 0.5) * 2.0 * spacing * mk;
   let eff = spacing * (1.0 + mk);
@@ -135,23 +135,33 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     cov += vec3f(max(mv.x - dv.x * dv.x, 0.0), max(mv.y - dv.y * dv.y, 0.0), mv.z - dv.x * dv.y);
   }
   let dist = length(in.rel);
-  let V = -in.rel / dist;
+  let V = -in.rel / max(dist,0.001);
   let Ld = F.sunDir.xyz;
 
   // slope statistics (LEAN): add unresolved capillary roughness + sun disk size
   // unresolved roughness; grows with distance to reach Cox-Munk-like totals in the far sheen
   let unres = F.waterCol.w + 0.0035 * smoothstep(30.0, 500.0, dist);
-  cov.x += unres;
-  cov.y += unres;
   let jx = max(1.0 + jxx, 0.15);
   let jz = max(1.0 + jzz, 0.15);
-  let sl = vec2f(s.x / jx, s.y / jz);
+  let slopeDet = max(jx*jz-jxz*jxz,0.12);
+  let sl = clamp(vec2f(s.x*jz-s.y*jxz,s.y*jx-s.x*jxz)/slopeDet,vec2f(-12.0),vec2f(12.0));
+  // LEAN moments are in undisplaced coordinates, just like s. Transform their
+  // covariance by the same inverse Jacobian so compressed detail is filtered
+  // with its actual world-space variance instead of becoming thin bright ridges.
+  let inverseJ=vec3f(jz,jx,-jxz)/slopeDet;
+  let transformed=vec3f(
+    inverseJ.x*inverseJ.x*cov.x+inverseJ.z*inverseJ.z*cov.y+2.0*inverseJ.x*inverseJ.z*cov.z,
+    inverseJ.z*inverseJ.z*cov.x+inverseJ.y*inverseJ.y*cov.y+2.0*inverseJ.y*inverseJ.z*cov.z,
+    inverseJ.x*inverseJ.z*cov.x+inverseJ.y*inverseJ.z*cov.y+(inverseJ.x*inverseJ.y+inverseJ.z*inverseJ.z)*cov.z);
+  cov=vec3f(max(transformed.xy,vec2f(0.0)),transformed.z);
+  cov.x+=unres; cov.y+=unres;
+  cov.z=clamp(cov.z,-sqrt(cov.x*cov.y)*0.995,sqrt(cov.x*cov.y)*0.995);
   let nrm = normalize(vec3f(-sl.x, 1.0, -sl.y));
   // specular anti-aliasing: slope variation across the pixel widens the lobe
   let dsx = dpdx(sl);
   let dsy = dpdy(sl);
   let aa = vec3f(dsx.x * dsx.x + dsy.x * dsy.x, dsx.y * dsx.y + dsy.y * dsy.y, dsx.x * dsx.y + dsy.x * dsy.y) * 0.5;
-  cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
+  cov += aa * min(1.0, mix(0.03,0.12,min(F.stormP.x,1.0)) / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
   let sunE = sunIlluminance() * sunVis[0];
@@ -183,7 +193,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let sig = sqrt(max(cov.x + cov.y, 1e-6) * 0.5);
   let vh = normalize(vec3f(V.x, 0.0, V.z) + vec3f(1e-5, 0.0, 0.0));
   let sigV = sqrt(max(vh.x * vh.x * cov.x + vh.z * vh.z * cov.y + 2.0 * vh.x * vh.z * cov.z, 1e-6));
-  let aV = max(V.y, 1e-3) / max(sqrt(1.0 - V.y * V.y), 1e-3) / (1.4142 * sigV);
+  let aV = max(V.y, 1e-3) / max(sqrt(max(1.0 - V.y * V.y,0.0)), 1e-3) / (1.4142 * sigV);
   let tilt = 0.32 * sigV * (1.0 - smoothstep(0.0, 2.5, aV));
   let nV = normalize(nrm + vh * tilt);
   var R = reflect(-V, nV);
@@ -203,7 +213,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   // upwelling light is diffuse: light it with smooth terms only (no per-pixel normal noise)
   var body = F.waterCol.rgb * (skyHemi * 1.6 + sunE * max(Ld.y, 0.0) * 0.8);
   // light transmitted through the thin upper part of backlit crests
-  let crest = clamp((in.height - 0.05) / 0.9, 0.0, 1.0);
+  let crest = clamp((in.height-0.05)/max(0.9,F.stormP.w*0.35),0.0,1.0);
   let toSun = max(dot(Ld, -V), 0.0);
   let thin = pow(clamp(0.5 - 0.5 * dot(Ld, nrm), 0.0, 1.0), 3.0);
   let k1 = F.sssCol.w * crest * crest * pow(toSun, 4.0) * thin * exp(-dist / 600.0);
@@ -220,13 +230,16 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let fw1 = textureSample(foamWorld, sampR, xz / F.lodP.w, 1u);
   let fwl = mix(fw1, fw0, w0) * w1;
   let fresh = clamp((F.foamP.x - J) * F.foamP.y, 0.0, 1.0);
-  var cover = clamp((max(fwl.r, fresh * (1.0 - w1 * 0.7)) + fwl.g * 0.6) * F.foamP.z, 0.0, 1.5);
+  let foamStrength=max(F.foamP.z,0.0);
+  // Freshness changes the core's appearance, rather than counting the same
+  // injected foam a second time. Zero strength disables every foam contribution.
+  var cover=1.0-exp(-max(fwl.r,fresh*(1.0-w1*0.7))*foamStrength*0.65);
   // aged foam breaks into wind-aligned streaks; fresh crest foam stays dense
   let wd = F.windP[0].xy;
   let ws = vec2f(dot(xz, wd), dot(xz, vec2f(-wd.y, wd.x)));
-  let streak = textureSample(foamTex, sampR, ws * vec2f(0.035, 0.11)).a;
+  let streak = textureSample(foamTex, sampR, ws * vec2f(0.018, 0.045)+vec2f(gustN*0.13,-gustN*0.09)).a;
   let freshK = clamp(fwl.g * 2.0 + fresh, 0.0, 1.0);
-  cover *= mix(smoothstep(0.25, 0.75, streak) * 1.5, 1.0, freshK);
+  cover *= mix(mix(0.55,1.15,smoothstep(0.2,0.8,streak)),1.0,freshK);
   let pat = foamPattern(xz, F.camPos.w);
   let fw = fwidth(pat) + 0.03;
   // soft threshold: thin foam is a translucent film, dense foam is opaque white
@@ -235,10 +248,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let fm = smoothstep(1.0 - cover - fw - soft, 1.0 - cover + fw + soft, pat);
   var foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
   // freshly broken crests: dense, almost opaque core
-  foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+  foamMask = max(foamMask, smoothstep(0.6, 1.0, fwl.g) * smoothstep(0.45, 0.75, pat + 0.1) * 0.85 * min(foamStrength,1.0));
   // submerged bubbles brighten and tint the water just beneath foam
   body += F.sssCol.rgb * (sunE * 0.05 + ambient * 0.35) * clamp(cover, 0.0, 1.0);
-  body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35;
+  body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35 * min(foamStrength,1.0);
   // bubbly brightness variation inside the foam
   let bub = textureSample(foamTex, sampR, xz * 1.9 + vec2f(0.21, 0.53)).g;
   let foamAlb = vec3f(0.82, 0.87, 0.92) * (0.78 + 0.3 * bub);
@@ -259,6 +272,8 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     if (F.post.w > 6.5 && F.post.w < 7.5) { return vec4f(skyUp, 1.0); }
     return vec4f(fwl.r, fwl.g, fresh, 1.0) * 0.2;
   }
+  // Crest/trough contrast follows resolved wave height, not a displacement multiplier.
+  body *= mix(1.0, mix(0.5,1.12,smoothstep(-0.25,0.3,in.height/max(F.stormP.w,1.0))),min(F.stormP.x,1.0));
   var col = body * (1.0 - Fr) + refl * Fr + spec;
   col = mix(col, foamLit, foamMask * 0.95);
 
@@ -278,22 +293,39 @@ export const HEIGHT_PROBE = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
-@group(0) @binding(3) var<storage, read_write> outH: array<f32, 4>;
-fn dispAt(xz: vec2f) -> vec3f {
-  var d = vec3f(0.0);
-  for (var c = 0u; c < ${CASCADES}u; c++) {
-    d += textureSampleLevel(dispTex, samp, xz * F.cascInvL[c >> 2u][c & 3u], c, 0.0).xyz;
+@group(0) @binding(3) var<storage, read_write> outH: array<f32, 8>;
+@group(0) @binding(4) var derivTex: texture_2d_array<f32>;
+struct Surface { d: vec3f, j: vec3f };
+fn surfaceAt(xz: vec2f) -> Surface {
+  var r: Surface;
+  for (var c=0u;c<${CASCADES}u;c++) {
+    let uv=xz*F.cascInvL[c>>2u][c&3u];
+    let a=textureSampleLevel(dispTex,samp,uv,c,0.0);
+    let b=textureSampleLevel(derivTex,samp,uv,c,0.0);
+    r.d+=a.xyz; r.j+=vec3f(b.z,b.w,a.w);
   }
-  return d;
+  return r;
 }
-@compute @workgroup_size(1)
-fn main() {
-  let goal = F.camPos.xz;
-  var x0 = goal;
-  for (var i = 0; i < 4; i++) {
-    let d = dispAt(x0);
-    x0 = goal - d.xz;
+@compute @workgroup_size(4)
+fn main(@builtin(local_invocation_index) k: u32) {
+  let offsets=array<vec2f,4>(vec2f(0.0),vec2f(0.6,0.0),vec2f(-0.3,0.52),vec2f(-0.3,-0.52));
+  let goal=F.camPos.xz+offsets[k];
+  var x=goal;
+  var bestX=x; var bestError=1e20;
+  for(var i=0;i<16;i++) {
+    let r=surfaceAt(x);
+    let residual=x+r.d.xz-goal;
+    let error=length(residual);
+    if(error<bestError) { bestError=error; bestX=x; }
+    if(error<0.002) { break; }
+    let ax=1.0+r.j.x; let az=1.0+r.j.y; let crossJ=r.j.z;
+    let det=ax*az-crossJ*crossJ;
+    var step=residual*0.4;
+    if(det>0.12) { step=vec2f(az*residual.x-crossJ*residual.y,ax*residual.y-crossJ*residual.x)/det; }
+    x-=step*(min(1.0,8.0/max(length(step),0.001))*0.8);
   }
-  outH[0] = dispAt(x0).y;
+  var result=surfaceAt(x);
+  if(length(x+result.d.xz-goal)>bestError) { x=bestX; result=surfaceAt(x); }
+  outH[k]=result.d.y; outH[k+4u]=length(x+result.d.xz-goal);
 }
 `;

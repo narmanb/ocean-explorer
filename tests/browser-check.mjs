@@ -21,7 +21,7 @@ const check = (condition, message) => { assert.ok(condition, message); console.l
 async function setup(page) {
   page.on('pageerror', (e) => { throw e; });
   await page.addInitScript(({ offscreen, encodeOnly }) => {
-    window.__audit = { dispatches: {}, submits: 0, errors: [], frame: [], draws: {} };
+    window.__audit = { dispatches: {}, submits: 0, sim:[], errors: [], frame: [], draws: {} };
     const request = GPUAdapter.prototype.requestDevice;
     GPUAdapter.prototype.requestDevice = async function (...args) {
       const device = await request.apply(this, args); window.__testDevice = device;
@@ -29,6 +29,7 @@ async function setup(page) {
     };
     const write = GPUQueue.prototype.writeBuffer;
     GPUQueue.prototype.writeBuffer = function (buffer, offset, data, ...args) {
+      if(buffer.label==='sim ubo')window.__audit.sim=Array.from(data);
       if (buffer.label === 'frame ubo') window.__audit.frame = Array.from(data);
       return write.call(this, buffer, offset, data, ...args);
     };
@@ -86,14 +87,30 @@ try {
   const page = await context.newPage();
   await setup(page);
   await ready(page, `http://localhost:${port}/?touch=1&profile=1&clouds=0&veil=0`);
-  check(await page.locator('.settings-category').count() === 5, 'five settings categories');
+  check(await page.getByLabel('Storm preset',{exact:true}).inputValue()==='original','startup restores the original sunset preset');
+  check(await page.locator('.settings-category').count() === 6, 'six settings categories');
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.locator('summary').filter({hasText:'Storm & Extreme Seas'}).click();
+  const stormPreset=page.getByLabel('Storm preset',{exact:true});
+  for(const id of ['calm','rough','severe','cross','cinematic','calm','cinematic']) {
+    await stormPreset.selectOption(id); await frames(page);
+    check(await stormPreset.inputValue()===id,'preset switches: '+id);
+    check(await page.evaluate(()=>window.__audit.frame.every(Number.isFinite)&&window.__audit.sim.every(Number.isFinite)),'finite uniforms during weather transition');
+  }
+  await page.waitForTimeout(10000); await frames(page);
+  check(await page.evaluate(()=>window.__audit.sim[44]>39&&window.__audit.sim[56]>31),'both cinematic swell systems reach the spectrum');
+  const atmoBefore=await page.evaluate(()=>window.__audit.dispatches.multiscatter); await frames(page);
+  check(await page.evaluate(()=>window.__audit.dispatches.multiscatter)===atmoBefore,'settled fractional haze does not regenerate atmosphere LUTs');
+  const angle=page.locator('label').filter({hasText:'Crossing angle (deg)'}).locator('input');
+  await angle.fill('-70'); await angle.dispatchEvent('input');
+  check(await stormPreset.inputValue()==='custom','crossing angle creates a custom sea state');
+  await stormPreset.selectOption('original'); await page.waitForTimeout(14000); await frames(page);
   await page.locator('summary').filter({ hasText: 'Wind' }).click();
-  const slider = page.locator('input[type=range]').first();
+  const slider = page.locator('details').filter({has:page.locator('summary',{hasText:'Wind'})}).locator('input[type=range]').first();
   await slider.focus(); await page.keyboard.press('h');
   check(await page.locator('#panel').isVisible(), 'focused setting does not trigger H shortcut');
   await slider.fill('8'); await slider.dispatchEvent('input'); await frames(page);
-  check(await page.locator('output').first().textContent() === '8', 'wind slider updates');
+  check(await slider.locator('..').locator('output').textContent() === '8', 'wind slider updates');
   const skyDispatches = await page.evaluate(() => window.__audit.dispatches.skyview);
   await frames(page);
   check(await page.evaluate(() => window.__audit.dispatches.skyview) === skyDispatches, 'stationary sky LUT is cached');
@@ -107,14 +124,14 @@ try {
     const inputs = section.locator('input[type=range]');
     for (let i = 0; i < await inputs.count(); i++) {
       const input = inputs.nth(i);
-      const value = await input.evaluate((el) => String(Math.min(Number(el.max), Number(el.value) + Number(el.step))));
+      const value = await input.evaluate((el) => String(Number(Math.min(Number(el.max), Number(el.value) + Number(el.step)).toFixed(5))));
       await input.fill(value); await input.dispatchEvent('input');
       check(await input.locator('..').locator('output').textContent() === await input.inputValue(), category + ' slider responds');
     }
     await frames(page);
   }
   const bloom = page.locator('label').filter({ hasText: 'Bloom' }).locator('input');
-  const bloomValue = await bloom.inputValue(); await bloom.fill('0'); await bloom.dispatchEvent('input'); await frames(page);
+  const bloomValue = await bloom.inputValue(); await bloom.fill('0'); await bloom.dispatchEvent('input'); await page.waitForTimeout(8200); await frames(page);
   const bloomBefore = await page.evaluate(() => window.__audit.draws['bloom down']); await frames(page);
   check(await page.evaluate(() => window.__audit.draws['bloom down']) === bloomBefore, 'zero bloom skips its render passes');
   await bloom.fill(bloomValue); await bloom.dispatchEvent('input');
@@ -157,7 +174,9 @@ try {
   await page.evaluate(() => document.exitFullscreen()); await frames(page);
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('button', { name: 'Measure 15 seconds' }).click();
+  check(await page.locator('#panel').isHidden(),'measurement immediately closes the whole settings panel');
   await page.waitForFunction(() => !Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Download last report').disabled, null, { timeout: 600000 });
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const download = page.waitForEvent('download'); await page.getByRole('button', { name: 'Download last report' }).click();
   const file = await download; const report = JSON.parse(fs.readFileSync(await file.path(), 'utf8'));
   check(report.durationMs >= 15000 && report.frames.frames > 0 && (encodeOnly ? report.gpu === null : report.gpu?.frames > 0), encodeOnly ? 'encoding-only report contains frame samples and honestly unavailable GPU timing' : 'report contains real frame and GPU samples');
@@ -172,6 +191,7 @@ try {
     const p = await context.newPage(); await p.setViewportSize({ width: 320, height: 180 }); await setup(p);
     const url = entry === 'index.html' ? `http://localhost:${port}/index.html` : pathToFileURL(path.join(root, entry)).href;
     await ready(p, url + '?touch=0&aa=1&clouds=0&veil=0');
+    check(await p.getByLabel('Storm preset',{exact:true}).inputValue()==='original',entry+' defaults to Original Sunset');
     check(await p.locator('#touch-ui').isHidden(), entry + ' desktop layout');
     const z = await p.evaluate(() => window.__audit.frame[18]); await p.keyboard.down('w'); await frames(p); await p.keyboard.up('w');
     check(await p.evaluate(() => window.__audit.frame[18]) < z, entry + ' desktop WASD');

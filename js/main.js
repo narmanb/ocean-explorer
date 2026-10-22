@@ -2,6 +2,8 @@
 // FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post.
 // Normal frames reuse uniform arrays and most descriptors. Optional diagnostics collect
 // samples; WebGPU swap-chain views and command buffers are necessarily transient.
+import { DEFAULT_SEA, STORM_PRESETS, STORM_CONTROLS, advanceSea, seaBounds, effectiveChop, crossingAngle, surfaceCameraY, updateSurfaceProbe, initializeSurfaceProbe } from './storm.js';
+import { SPINDRIFT } from './wgsl/spray.js';
 import { targetSize, bloomLevels, summarizeSamples } from './runtime.js';
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
 import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIPS, FOAM_UPDATE, ARRAY16_MIPS, FOAM_RES } from './wgsl/sim.js';
@@ -16,25 +18,8 @@ const D2R = Math.PI / 180;
 // ----------------------------------------------------------------------------------------
 // Tunable parameters (UI panel edits these)
 // ----------------------------------------------------------------------------------------
-export const P = {
-  windSpeed: 7.0,      // m/s at 10 m
-  windDir: 118,        // deg, direction waves travel (90 = towards +Z, i.e. towards the viewer)
-  fetchKm: 90,
-  swellHs: 1.8,        // m significant height
-  swellDir: 94,
-  swellLength: 120,    // m peak wavelength
-  swellSpread: 48,     // cos^2s exponent
-  choppy: 1.25,
-  turbidity: 1.6,     // water body brightness (coastal sediment / plankton)
-  foam: 1.0,
-  sunElev: 2.6,        // deg
-  sunAzim: 4,          // deg (0 = straight ahead of the start view)
-  exposure: 1.35,
-  haze: 3.0,
-  clouds: 0.40,
-  veil: 0.36,
-  bloom: 0.10,
-};
+export const P = { ...STORM_PRESETS[qs.get('preset')]?.values || STORM_PRESETS.original.values };
+let activePreset = STORM_PRESETS[qs.get('preset')] ? qs.get('preset') : 'original';
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
 function fail(msg) {
@@ -119,7 +104,7 @@ async function main() {
   const SIM_MIP_COUNT = Math.log2(N) + 1;
   const specBytes = N * N * C * 16;
   const mkBuf = (size, usage, label) => device.createBuffer({ size, usage, label });
-  const simUBO = mkBuf(224, GU.UNIFORM | GU.COPY_DST, 'sim ubo');
+  const simUBO = mkBuf(256, GU.UNIFORM | GU.COPY_DST, 'sim ubo');
   const h0Buf = mkBuf(specBytes, GU.STORAGE, 'h0');
   const specA = mkBuf(specBytes, GU.STORAGE, 'specA');
   const specB = mkBuf(specBytes, GU.STORAGE, 'specB');
@@ -199,8 +184,8 @@ async function main() {
     label: 'foam world ' + i, size: [FOAM_RES, FOAM_RES, 2], format: 'rgba16float', mipLevelCount: FOAMW_MIPS,
     usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
   }));
-  const foamUBO = mkBuf(144, GU.UNIFORM | GU.COPY_DST, 'foam ubo');
-  const foamUArr = new ArrayBuffer(144);
+  const foamUBO = mkBuf(160, GU.UNIFORM | GU.COPY_DST, 'foam ubo');
+  const foamUArr = new ArrayBuffer(160);
   const foamUI = new Int32Array(foamUArr);
   const foamUF = new Float32Array(foamUArr);
   const foamSnap = new Int32Array(4);  // previous camera texel per level
@@ -240,7 +225,7 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
-  const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const frameUBO = mkBuf(416, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
@@ -265,12 +250,12 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
-  let MSAA = qs.get('aa') === '1' ? 1 : 4;
+  let MSAA = qs.get('aa') === '4' ? 4 : 1;
   let fpsLimit = [30, 60].includes(Number(qs.get('fps'))) ? Number(qs.get('fps')) : 0;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, sprayMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(SPINDRIFT, 'crest spindrift'),
   ]);
   const oceanDesc = {
     label: 'ocean', layout: 'auto',
@@ -291,15 +276,24 @@ async function main() {
     depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   };
+  const sprayDesc = {
+    label:'crest spindrift', layout:'auto', vertex:{module:sprayMod,entryPoint:'vs'},
+    fragment:{module:sprayMod,entryPoint:'fs',targets:[{format:HDR,blend:{
+      color:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'},
+      alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'},
+    }}]}, primitive:{topology:'triangle-list'},
+    depthStencil:{format:'depth32float',depthWriteEnabled:false,depthCompare:'greater'},
+  };
   const pipelinePairs = new Map();
   async function scenePipelines(samples) {
     if (!pipelinePairs.has(samples)) pipelinePairs.set(samples, Promise.all([
       device.createRenderPipelineAsync({ ...oceanDesc, multisample: { count: samples } }),
       device.createRenderPipelineAsync({ ...skyDesc, multisample: { count: samples } }),
+      device.createRenderPipelineAsync({ ...sprayDesc, multisample: { count: samples } }),
     ]));
     return pipelinePairs.get(samples);
   }
-  let [oceanPipe, skyPipe] = await scenePipelines(MSAA);
+  let [oceanPipe, skyPipe, sprayPipe] = await scenePipelines(MSAA);
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -326,15 +320,24 @@ async function main() {
   let bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
 
+  const sprayEntries = [{buffer:frameUBO},fullArr(dispTex),fullArr(derivTex),sampRepeat,foamTex.createView()];
+  let bgSpray = bg(sprayPipe,sprayEntries,'crest spindrift');
+
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
   const probePipe = await computePipe(HEIGHT_PROBE, 'height probe');
-  const probeOut = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'probe out');
-  const probeRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'probe read');
-  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }], 'probe');
-  let probePending = false, waterH = 0;
+  const probeOut = mkBuf(32, GU.STORAGE | GU.COPY_SRC, 'probe out');
+  const probeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'probe read');
+  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }, fullArr(derivTex)], 'probe');
+  let probePending = false, waterH = 0, waterGuard = 0, probeResidual = 0;
+  const surfaceProbe={height:0,guard:0,residual:0,rejected:0,centerValid:false,validCount:0};
   const onProbe = () => {
-    waterH = new Float32Array(probeRead.getMappedRange(0, 16))[0];
+    const heights = new Float32Array(probeRead.getMappedRange(0,32));
+    if (heights.every(Number.isFinite)) {
+      updateSurfaceProbe(surfaceProbe,heights);
+      probeResidual=surfaceProbe.residual;
+      waterH=surfaceProbe.height; waterGuard=surfaceProbe.guard;
+    } else stopRenderer('Water-height probe returned a non-finite value.');
     probeRead.unmap();
     probePending = false;
   };
@@ -475,8 +478,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Uniform data
   // --------------------------------------------------------------------------------------
-  const simF = new Float32Array(56);
-  const frameF = new Float32Array(96);
+  const simF = new Float32Array(64);
+  const frameF = new Float32Array(104);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -490,21 +493,27 @@ async function main() {
       simF[16 + c] = c < C - 1 ? (2 * Math.PI * 6) / CASC_L[c + 1] : (Math.PI * N / L) * 0.98; // kMax
     }
     for (let c = 1; c < C; c++) simF[8 + c] = simF[16 + c - 1];
-    simF[40] = P.windSpeed; simF[41] = P.windDir * D2R; simF[42] = P.fetchKm * 1000; simF[43] = 3.3;
-    const ks = 2 * Math.PI / P.swellLength;
-    simF[44] = P.swellHs; simF[45] = P.swellDir * D2R; simF[46] = Math.sqrt(9.81 * ks); simF[47] = P.swellSpread;
-    simF[48] = P.choppy; simF[49] = 0.0012; simF[50] = LOOP; simF[51] = 1;
-    simF[54] = 2.2; simF[55] = 1.0;
+    simF[40] = E.windSpeed; simF[41] = E.windDir * D2R; simF[42] = E.fetchKm * 1000; simF[43] = 3.3;
+    const ks = 2 * Math.PI / E.swellLength;
+    simF[44] = E.swellHs; simF[45] = E.swellDir * D2R; simF[46] = Math.sqrt(9.81 * ks); simF[47] = E.swellSpread;
+    simF[48] = effectiveChop(E); simF[49] = 0.0012; simF[50] = LOOP; simF[51] = 1;
+    simF[54] = 2.2; simF[55] = 1.0+0.5*E.storm;
+    simF[56]=E.swell2Hs; simF[57]=E.swell2Dir*D2R;
+    simF[58]=Math.sqrt(9.81*2*Math.PI/E.swell2Length); simF[59]=E.swell2Spread;
+    simF[60]=E.storm; simF[61]=E.peakGamma;
   }
 
   // --------------------------------------------------------------------------------------
   // Camera & input
   // --------------------------------------------------------------------------------------
   const cam = { x: 0, y: 2.4, z: 0, yaw: 0, pitch: -5.5 * D2R, fovY: 58 * D2R, speed: 6 };
+  let cameraMode=qs.get('camera')==='free'?'free':'surface';
+  let surfaceClearance=3.0;
   if (qs.get('cam')) {
     const v = qs.get('cam').split(',').map(Number);
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2]; cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
   }
+  if(qs.get('cam')) surfaceClearance=Math.max(0.9,cam.y);
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
   const touch = { fwd:0, str:0, up:0, boost:false };
@@ -543,10 +552,11 @@ async function main() {
     mz += -fwd * cp * cy + str * sy;
     const boost = keys.ShiftLeft || keys.ShiftRight || touch.boost ? 5 : 1;
     const v = cam.speed * boost * dt;
-    cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
-    cam.y = Math.max(1.0, Math.min(3000, cam.y));
-    // keep clear of the actual (displaced) water surface under the camera
-    if (cam.y < waterH + 0.9) cam.y += (waterH + 0.9 - cam.y) * Math.min(1, dt * 12);
+    cam.x += mx * v; if(cameraMode!=='surface') cam.y += my*v; cam.z += mz * v;
+    if (cameraMode==='surface') {
+      surfaceClearance=Math.max(0.9,Math.min(3000,surfaceClearance+my*v));
+      cam.y=surfaceCameraY(cam.y,waterH,waterGuard,surfaceClearance,dt);
+    } else cam.y=Math.max(waterGuard+0.8,Math.min(3000,cam.y));
   }
 
   // --------------------------------------------------------------------------------------
@@ -555,8 +565,8 @@ async function main() {
   const ranges = new Float64Array(LODS);
   for (let l = 0; l < LODS; l++) ranges[l] = R0 * Math.pow(2, l);
   const planes = new Float64Array(16);
-  const HB = 4.0;   // vertical bound of displaced surface
-  const XB = 4.0;   // horizontal displacement margin for culling
+  let HB = 4.0;   // vertical bound of displaced surface
+  let XB = 4.0;   // horizontal displacement margin for culling
   let nodeCount = 0, ccx = 0, ccy = 0, ccz = 0;
 
   function sphereHit(x0, z0, size, r) {
@@ -596,6 +606,7 @@ async function main() {
     return true;
   }
   function selectAll() {
+    const bounds=seaBounds(E); HB=bounds.height; XB=bounds.horizontal;
     nodeCount = 0;
     ccx = cam.x; ccy = cam.y; ccz = cam.z;
     // side planes from the camera-relative view-projection (rows 3±0, 3±1)
@@ -644,23 +655,26 @@ async function main() {
     f[20] = rx * tanX; f[21] = ry * tanX; f[22] = rz * tanX; f[23] = 0;
     f[24] = ux * tanY; f[25] = uy * tanY; f[26] = uz * tanY; f[27] = 0;
     f[28] = fx; f[29] = fy; f[30] = fz; f[31] = 0;
-    const se = P.sunElev * D2R, sa = P.sunAzim * D2R;
-    f[32] = Math.sin(sa) * Math.cos(se); f[33] = Math.sin(se); f[34] = -Math.cos(sa) * Math.cos(se); f[35] = 14.0;
+    const se = E.sunElev * D2R, sa = E.sunAzim * D2R;
+    f[32] = Math.sin(sa) * Math.cos(se); f[33] = Math.sin(se); f[34] = -Math.cos(sa) * Math.cos(se); f[35] = 14.0*(1-0.25*Math.min(E.storm,1));
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
     for (let c = 0; c < C; c++) { f[40 + c] = CASC_L[c]; f[48 + c] = 1 / CASC_L[c]; }
-    f[56] = Math.cos(P.windDir * D2R); f[57] = Math.sin(P.windDir * D2R); f[58] = P.windSpeed;
+    f[56] = Math.cos(E.windDir * D2R); f[57] = Math.sin(E.windDir * D2R); f[58] = E.windSpeed;
     f[64] = R0; f[65] = GRID; f[66] = FOAM_LEVEL_SIZE[0]; f[67] = FOAM_LEVEL_SIZE[1];
-    f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
-    f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
+    f[68] = E.exposure; f[69] = E.bloom; f[70] = frameIndex; f[71] = DBG;
+    f[72] = Math.round(E.haze*10)/10; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = E.veil; f[75] = 0.9;
     // deep water body scatter colour (greenish coastal water), unresolved slope variance
-    f[76] = 0.016 * P.turbidity; f[77] = 0.080 * P.turbidity; f[78] = 0.096 * P.turbidity; f[79] = 0.0024;
+    f[76] = 0.016 * E.turbidity; f[77] = 0.080 * E.turbidity; f[78] = 0.096 * E.turbidity; f[79] = 0.0024;
     f[80] = 0.035; f[81] = 0.120; f[82] = 0.085; f[83] = 2.6;
-    f[84] = 0.36 + 0.12 * P.foam; f[85] = 2.5; f[86] = 1.0; f[87] = 1.0;
-    f[88] = (5.802e-3 + 4.40e-3 * P.haze) * 1e-3;
-    f[89] = (13.558e-3 + 4.40e-3 * P.haze) * 1e-3;
-    f[90] = (33.1e-3 + 4.40e-3 * P.haze) * 1e-3;
-    f[91] = 1.1e-4;
-    f[92] = 1.5; f[93] = P.clouds; f[94] = 2.2; f[95] = time;
+    f[84] = 0.46 + 0.04*E.storm; f[85] = 2.5; f[86] = E.foam; f[87] = 1.0;
+    f[88] = (5.802e-3 + 4.40e-3 * E.haze) * 1e-3;
+    f[89] = (13.558e-3 + 4.40e-3 * E.haze) * 1e-3;
+    f[90] = (33.1e-3 + 4.40e-3 * E.haze) * 1e-3;
+    f[91] = 1.1e-4+E.mist*0.0006;
+    f[92] = 1.5*(1.0-0.5*Math.min(E.storm,1)); f[93] = E.clouds; f[94] = 2.2+E.storm*0.8; f[95] = time;
+    const bounds=seaBounds(E);
+    f[96]=E.storm; f[97]=E.mist; f[98]=E.spray; f[99]=bounds.hs;
+    f[100]=bounds.height; f[101]=effectiveChop(E);
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -674,13 +688,16 @@ async function main() {
     if (!panel.classList.contains('hidden')) document.exitPointerLock?.();
   }
   const SLIDERS = [
-    ['windSpeed', 'Wind speed (m/s)', 2, 20, 0.1, 'spec'],
+    ...STORM_CONTROLS,
+    ['windSpeed', 'Wind speed (m/s)', 2, 55, 0.1, 'spec'],
     ['windDir', 'Wind direction (deg)', 0, 360, 1, 'spec'],
-    ['fetchKm', 'Fetch (km)', 5, 800, 1, 'spec'],
-    ['swellHs', 'Swell height (m)', 0, 4, 0.05, 'spec'],
-    ['swellLength', 'Swell wavelength (m)', 30, 300, 1, 'spec'],
+    ['fetchKm', 'Fetch (km)', 5, 1200, 1, 'spec'],
+    ['swellHs', 'Primary swell height (m)', 0, 48, 0.05, 'spec'],
+    ['swellLength', 'Primary wavelength (m)', 40, 700, 1, 'spec'],
     ['swellDir', 'Swell direction (deg)', 0, 360, 1, 'spec'],
-    ['choppy', 'Choppiness', 0, 1.6, 0.01, 'spec'],
+    ['swellSpread','Primary concentration',2,96,1,'spec'],
+    ['peakGamma','Swell peak sharpness',2,9,0.1,'spec'],
+    ['choppy', 'Choppiness', 0, 1.8, 0.01, 'spec'],
     ['turbidity', 'Water turbidity', 0.2, 3, 0.01, ''],
     ['foam', 'Foam', 0, 3, 0.01, ''],
     ['sunElev', 'Sun elevation (deg)', -2, 60, 0.1, ''],
@@ -696,6 +713,9 @@ async function main() {
     const v = Number(qs.get(k)), limits = SLIDERS.find((s) => s[0] === k);
     if (Number.isFinite(v)) P[k] = limits ? Math.max(limits[2], Math.min(limits[3], v)) : v;
   }
+  const E={...P};
+  const spectrumKeys=new Set(['windSpeed','windDir','fetchKm','swellHs','swellDir','swellLength','swellSpread','swell2Hs','swell2Dir','swell2Length','swell2Spread','choppy','peakGamma','storm']);
+  const spectrumPrevious={...E};
   const panelHeading = document.createElement('div');
   panelHeading.className = 'panel-heading';
   const panelTitle = document.createElement('span');
@@ -710,14 +730,16 @@ async function main() {
   panel.appendChild(panelHeading);
   const sliders = new Map(SLIDERS.map((entry) => [entry[0], entry]));
   const groupDefinitions = [
+    ['Storm & Extreme Seas',STORM_CONTROLS.map((s)=>s[0])],
     ['Wind', ['windSpeed', 'windDir', 'fetchKm']],
-    ['Waves', ['swellHs', 'swellLength', 'swellDir', 'choppy']],
+    ['Waves', ['swellHs', 'swellLength', 'swellDir','swellSpread','peakGamma', 'choppy']],
     ['Water', ['turbidity', 'foam']],
     ['Sky & Atmosphere', ['sunElev', 'sunAzim', 'haze', 'clouds', 'veil']],
     ['Graphics & Performance', ['exposure', 'bloom']],
   ];
   const categoryElements = [];
-  let graphicsControls;
+  let graphicsControls, stormControls;
+  const sliderViews=new Map();
   for (const [category, keysInGroup] of groupDefinitions) {
     const section = document.createElement('details');
     section.className = 'settings-category';
@@ -726,6 +748,7 @@ async function main() {
     const controls = document.createElement('div');
     controls.className = 'category-controls';
     if (category === 'Graphics & Performance') graphicsControls = controls;
+    if (category === 'Storm & Extreme Seas') stormControls=controls;
     for (const key of keysInGroup) {
       const [sliderKey, label, min, max, step, kind] = sliders.get(key);
       const row = document.createElement('label');
@@ -737,12 +760,14 @@ async function main() {
       Object.assign(inp, { type:'range', min, max, step, value:P[sliderKey] });
       inp.addEventListener('input', () => {
         cancelRecording('Measurement cancelled: environment changed.');
-        P[sliderKey] = Number(inp.value);
+        P[sliderKey] = Number(inp.value); activePreset='custom'; presetSelect.value='custom';
+        presetDescription.textContent='Custom sea state · parameters blend smoothly.'; syncCrossAngle();
         val.textContent = inp.value;
         if (kind === 'spec') needSpectrum = true;
         if (kind === 'lut') needLUT = true;
         if (['sunElev','sunAzim','haze','clouds','veil','turbidity'].includes(sliderKey)) envFull = 2;
       });
+      sliderViews.set(sliderKey,{input:inp,output:val});
       row.append(name, inp, val);
       controls.appendChild(row);
     }
@@ -753,6 +778,32 @@ async function main() {
     });
     panel.appendChild(section);
   }
+  const presetSelect=document.createElement('select'); presetSelect.setAttribute('aria-label','Storm preset');
+  for(const [id,preset] of Object.entries(STORM_PRESETS)) presetSelect.add(new Option(preset.name,id));
+  presetSelect.add(new Option('Custom','custom')); presetSelect.value=activePreset;
+  const presetDescription=document.createElement('div'); presetDescription.className='measure-status';
+  presetDescription.textContent=STORM_PRESETS[activePreset].description;
+  const presetRow=document.createElement('label'); presetRow.className='resolution-row';
+  const presetName=document.createElement('span'); presetName.textContent='Sea state';
+  presetRow.append(presetName,presetSelect); stormControls.prepend(presetRow,presetDescription);
+  const crossRow=document.createElement('label'); const crossName=document.createElement('span'); crossName.textContent='Crossing angle (deg)';
+  const crossInput=document.createElement('input'); Object.assign(crossInput,{type:'range',min:-180,max:180,step:1});
+  const crossOutput=document.createElement('output'); crossRow.append(crossName,crossInput,crossOutput); stormControls.append(crossRow);
+  function syncCrossAngle() { crossInput.value=String(Math.round(crossingAngle(P.swellDir,P.swell2Dir))); crossOutput.textContent=crossInput.value; }
+  function syncSliders() { for(const [key,view] of sliderViews) { view.input.value=P[key]; view.output.textContent=String(P[key]); } syncCrossAngle(); }
+  syncSliders();
+  crossInput.addEventListener('input',()=>{
+    cancelRecording('Measurement cancelled: crossing angle changed.');
+    P.swell2Dir=(P.swellDir+Number(crossInput.value)+360)%360;
+    activePreset='custom'; presetSelect.value='custom'; syncSliders();
+  });
+  presetSelect.addEventListener('change',()=>{
+    const preset=STORM_PRESETS[presetSelect.value]; if(!preset) return;
+    cancelRecording('Measurement cancelled: sea state changed.');
+    activePreset=presetSelect.value; Object.assign(P,preset.values); syncSliders();
+    presetDescription.textContent=preset.description+' Blending to the new sea…';
+    foamFirst=true; envFull=2;
+  });
   let recording = null, lastReport = null;
   let measureStatus;
   function cancelRecording(reason) {
@@ -790,20 +841,24 @@ async function main() {
     select.addEventListener('change', () => { cancelRecording('Measurement cancelled: graphics changed.'); onChange(select); });
     row.append(name, select); graphicsControls.append(row); return select;
   }
-  addSelect('Anti-aliasing', [[4, '4× MSAA (default)'], [1, 'Off (1×)']], MSAA, async (select) => {
+  addSelect('Anti-aliasing', [[1, 'Off (1×, default)'], [4, '4× MSAA']], MSAA, async (select) => {
     select.disabled = true;
     try {
       const samples = Number(select.value);
-      [oceanPipe, skyPipe] = await scenePipelines(samples);
+      [oceanPipe, skyPipe, sprayPipe] = await scenePipelines(samples);
       bgOcean = [0, 1].map((i) => bg(oceanPipe, oceanEntries(i), 'ocean' + i));
       bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
       cancelRecording('Measurement cancelled: anti-aliasing changed.');
+      bgSpray=bg(sprayPipe,sprayEntries,'crest spindrift');
       MSAA = samples; resize();
     } catch (e) { stopRenderer('Anti-aliasing pipeline failed: ' + e.message); }
     finally { select.disabled = false; }
   });
   addSelect('Frame-rate cap', [[0, 'Unlimited'], [60, '60 FPS'], [30, '30 FPS']], fpsLimit,
     (select) => { fpsLimit = Number(select.value); nextFrameAt = 0; });
+  addSelect('Camera mode',[['surface','Ride waves'],['free','Free flight + guard']],cameraMode,(select)=>{
+    cameraMode=select.value; surfaceClearance=Math.max(0.9,cam.y-waterH);
+  });
   const measureButton = document.createElement('button');
   measureButton.type = 'button'; measureButton.textContent = 'Measure 15 seconds';
   measureStatus = document.createElement('div'); measureStatus.className = 'measure-status';
@@ -815,6 +870,8 @@ async function main() {
     recording = { start: null, frames: [], gpu: [],
       stages: Object.fromEntries(stageNames.map((name) => [name, []])) };
     measureButton.disabled = true; measureStatus.textContent = 'Measuring… explore for 15 seconds.';
+    panel.classList.add('hidden');
+    measureButton.blur();
   });
   downloadButton.addEventListener('click', () => {
     const url = URL.createObjectURL(new Blob([JSON.stringify(lastReport, null, 2)], { type: 'application/json' }));
@@ -1010,11 +1067,12 @@ async function main() {
       foamUF[8 + l] = ts;
     }
     foamFirst = false;
-    foamUF[10] = dt; foamUF[11] = 0.22;          // decay 1/s
-    foamUF[12] = 0.52 + 0.16 * P.foam; foamUF[13] = 2.0; foamUF[14] = 1.0; foamUF[15] = 0;
+    foamUF[10] = dt; foamUF[11] = 0.22-0.08*Math.min(E.storm,1);          // decay 1/s
+    foamUF[12] = 0.62 + 0.04*E.storm; foamUF[13] = 2.0; foamUF[14] = 1.0+E.storm; foamUF[15] = 0;
     for (let c = 0; c < C; c++) { foamUF[16 + c] = CASC_L[c]; foamUF[24 + c] = 1 / CASC_L[c]; }
-    const drift = 0.03 * P.windSpeed;
-    foamUF[32] = Math.cos(P.windDir * D2R) * drift; foamUF[33] = Math.sin(P.windDir * D2R) * drift;
+    const drift = (0.03+0.07*E.storm) * E.windSpeed;
+    foamUF[32] = Math.cos(E.windDir * D2R) * drift; foamUF[33] = Math.sin(E.windDir * D2R) * drift;
+    foamUF[36]=E.storm; foamUF[37]=seaBounds(E).hs;
     device.queue.writeBuffer(foamUBO, 0, foamUArr);
   }
 
@@ -1049,7 +1107,7 @@ async function main() {
           createdAt: new Date().toISOString(), durationMs: now - recording.start,
           userAgent: navigator.userAgent,
           adapter: info ? { vendor: info.vendor, architecture: info.architecture, description: info.description } : null,
-          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P } },
+          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P }, effectiveParameters:{...E}, preset:activePreset, cameraMode, camera:{...cam}, surfaceClearance,probeResidual,probeRejected:surfaceProbe.rejected,waterHeight:waterH },
           frames: summarizeSamples(recording.frames), gpu: summarizeSamples(recording.gpu),
           gpuStages: profile && hasTS ? Object.fromEntries(stageNames.map((name) => [name, summarizeSamples(recording.stages[name])])) : null,
           note: 'GPU samples are asynchronous, every eighth rendered frame. Stage profiling adds pass boundaries. This is a 15-second sample, not a thermal stability test.',
@@ -1059,6 +1117,10 @@ async function main() {
       }
     }
     if (fixedDt) dt = fixedDt;
+    const changing=advanceSea(E,P,dt);
+    for(const key of spectrumKeys) if(E[key]!==spectrumPrevious[key]) {needSpectrum=true;spectrumPrevious[key]=E[key];}
+    if(Math.fround(Math.round(E.haze*10)/10)!==atmoF[0]) needLUT=true;
+    if(!changing && STORM_PRESETS[activePreset]) presetDescription.textContent=STORM_PRESETS[activePreset].description;
     updateCamera(dt);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
@@ -1081,7 +1143,7 @@ async function main() {
       needSpectrum = false;
     }
     if (needLUT) {
-      atmoF[0] = P.haze;
+      atmoF[0] = Math.round(E.haze*10)/10;
       device.queue.writeBuffer(atmoUBO, 0, atmoF);
       cp.setPipeline(transPipe);
       cp.setBindGroup(0, bgTrans);
@@ -1095,9 +1157,8 @@ async function main() {
     if (profile) { cp.end(); cp = enc.beginComputePass(stageDescs[1]); }
     encodeFoam(cp);
     if (profile) { cp.end(); cp = enc.beginComputePass(stageDescs[2]); }
-    cp.setPipeline(probePipe);
-    cp.setBindGroup(0, bgProbe);
-    cp.dispatchWorkgroups(1);
+    const doProbe=!probePending;
+    if(doProbe) { cp.setPipeline(probePipe); cp.setBindGroup(0,bgProbe); cp.dispatchWorkgroups(1); }
     // SKYVIEW_LUT depends only on clamped altitude, sun elevation, haze and its LUTs.
     // Camera yaw/position, clouds and time are applied by the sky/reflection shaders later.
     if (skyHeight !== frameF[73] || skySun !== frameF[33] || skyHaze !== frameF[72]) {
@@ -1134,9 +1195,10 @@ async function main() {
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
+    if(E.spray>0.001) { rp.setPipeline(sprayPipe); rp.setBindGroup(0,bgSpray); rp.draw(6,256); }
     rp.end();
 
-    for (let m = 0; m < (P.bloom > 0 ? bloomCount : 0); m++) {
+    for (let m = 0; m < (E.bloom > 0.0001 ? bloomCount : 0); m++) {
       downPasses[m].timestampWrites = profile && hasTS && m === 0 ?
         { querySet: tsQuery, beginningOfPassWriteIndex: 8 } : undefined;
       const p = enc.beginRenderPass(downPasses[m]);
@@ -1145,7 +1207,7 @@ async function main() {
       p.draw(3);
       p.end();
     }
-    for (let i = 0; i < (P.bloom > 0 ? upPasses.length : 0); i++) {
+    for (let i = 0; i < (E.bloom > 0.0001 ? upPasses.length : 0); i++) {
       const p = enc.beginRenderPass(upPasses[i]);
       p.setPipeline(upPipe);
       p.setBindGroup(0, upBGs[i]);
@@ -1153,12 +1215,12 @@ async function main() {
       p.end();
     }
 
-    compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
-    compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 1 / bloomCount;
+    compData[0] = E.exposure; compData[1] = E.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
+    compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19*(1-Math.min(E.storm,1)*0.8); compData[7] = 1 / bloomCount;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();
-    if (profile && hasTS) compPass.timestampWrites = P.bloom > 0 ?
+    if (profile && hasTS) compPass.timestampWrites = E.bloom > 0.0001 ?
       { querySet: tsQuery, endOfPassWriteIndex: 9 } : stageDescs[4].timestampWrites;
     const pc = enc.beginRenderPass(compPass);
     pc.setPipeline(compPipe);
@@ -1166,11 +1228,7 @@ async function main() {
     pc.draw(3);
     pc.end();
 
-    let doProbe = false;
-    if (!probePending && (frameIndex & 7) === 0) {
-      enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
-      doProbe = true;
-    }
+    if(doProbe) enc.copyBufferToBuffer(probeOut,0,probeRead,0,32);
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
       enc.resolveQuerySet(tsQuery, 0, queryCount, tsResolve, 0);
@@ -1223,6 +1281,18 @@ async function main() {
   }
 
   resize();
+  writeSimStatic(); simF[52]=simTime; simF[53]=1/60; device.queue.writeBuffer(simUBO,0,simF);
+  writeFrame(simTime); writeFoamUniforms(1/60);
+  const prime=device.createCommandEncoder(); const primePass=prime.beginComputePass();
+  primePass.setPipeline(initPipe); primePass.setBindGroup(0,bgInit); primePass.dispatchWorkgroups(N/16,N/16,C);
+  encodeSim(primePass); encodeFoam(primePass);
+  primePass.setPipeline(probePipe); primePass.setBindGroup(0,bgProbe); primePass.dispatchWorkgroups(1); primePass.end();
+  prime.copyBufferToBuffer(probeOut,0,probeRead,0,32); device.queue.submit([prime.finish()]);
+  await probeRead.mapAsync(GPUMapMode.READ); onProbe(); needSpectrum=false;
+  initializeSurfaceProbe(surfaceProbe,seaBounds(E).height);
+  waterH=surfaceProbe.height; waterGuard=surfaceProbe.guard;
+  cam.y=cameraMode==='surface'?Math.max(waterH+surfaceClearance,waterGuard+0.8):Math.max(cam.y,waterGuard+0.8);
+  last=performance.now();
   addEventListener('resize', resize);
   requestAnimationFrame(frame);
 }

@@ -27,7 +27,7 @@ SOFTWARE.
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Ocean Explorer — WebGPU</title>
+<title>Ocean Explorer — Storm Seas</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -136,6 +136,85 @@ function summarizeSamples(samples) {
   return { frames: samples.length, fps: 1000 / mean, meanMs: mean, p50Ms: percentile(0.5), p95Ms: percentile(0.95) };
 }
 
+// ---- js/storm.js ----
+// Sea-state targets. Heights are nominal significant swell heights, not individual crests.
+const DEFAULT_SEA = {
+  windSpeed:7, windDir:118, fetchKm:90,
+  swellHs:1.8, swellDir:94, swellLength:120, swellSpread:48,
+  swell2Hs:0, swell2Dir:185, swell2Length:180, swell2Spread:24,
+  peakGamma:6, choppy:1.25, storm:0, mist:0, spray:0,
+  turbidity:1.6, foam:1, sunElev:2.6, sunAzim:4,
+  exposure:1.35, haze:3, clouds:0.4, veil:0.36, bloom:0.1,
+};
+const STORM_CONTROLS = [
+  ['storm','Storm intensity',0,1.5,0.01,'spec'],
+  ['swell2Hs','Secondary swell height (m)',0,40,0.25,'spec'],
+  ['swell2Length','Secondary wavelength (m)',40,700,5,'spec'],
+  ['swell2Dir','Secondary direction (deg)',0,360,1,'spec'],
+  ['swell2Spread','Secondary concentration',2,96,1,'spec'],
+  ['mist','Sea mist',0,1,0.01,''],
+  ['spray','Crest spindrift',0,1,0.01,''],
+];
+const state=(values)=>({...DEFAULT_SEA,...values});
+const STORM_PRESETS = {
+  calm:{name:'Calm Ocean',description:'Gentle swells, clear air and open sky.',values:state({windSpeed:3,swellHs:0.5,swellLength:90,choppy:0.7,foam:0.3,sunElev:18,haze:1.4,clouds:0.18,veil:0.12})},
+  rough:{name:'Rough Seas',description:'A strong wind sea with broad, heaving swells.',values:state({windSpeed:18,fetchKm:250,swellHs:6,swellLength:170,swellSpread:22,swell2Hs:2,swell2Dir:160,storm:0.24,foam:1.4,mist:0.12,spray:0.15,sunElev:15,haze:3.8,clouds:0.65,veil:0.5,turbidity:0.9})},
+  severe:{name:'Severe Storm',description:'Massive storm swells, dense whitecaps and a low, threatening sky.',values:state({windSpeed:32,fetchKm:500,swellHs:20,swellLength:260,swellDir:70,swellSpread:20,swell2Hs:9,swell2Length:170,swell2Dir:155,swell2Spread:16,choppy:1.55,storm:0.7,foam:1.8,mist:0.35,spray:0.55,sunElev:15,sunAzim:-25,haze:4.8,clouds:0.85,veil:0.78,turbidity:0.65,exposure:1.1,bloom:0.06})},
+  cross:{name:'Cross Seas',description:'Two independently phased giant swell systems cross at 100°.',values:state({windSpeed:30,windDir:110,fetchKm:450,swellHs:26,swellLength:300,swellDir:55,swellSpread:32,swell2Hs:22,swell2Length:230,swell2Dir:155,swell2Spread:28,choppy:1.55,storm:0.75,foam:1.9,mist:0.3,spray:0.6,sunElev:17,sunAzim:-20,haze:4.4,clouds:0.82,veil:0.76,turbidity:0.65,exposure:1.15,bloom:0.06})},
+  cinematic:{name:'Cinematic Extreme',description:'Exaggerated mountains of water. Not a realistic storm forecast.',values:state({windSpeed:45,windDir:110,fetchKm:800,swellHs:40,swellLength:380,swellDir:65,swellSpread:44,swell2Hs:32,swell2Length:280,swell2Dir:170,swell2Spread:36,peakGamma:8,choppy:1.7,storm:1.25,foam:2.2,mist:0.48,spray:0.85,sunElev:18,sunAzim:-20,haze:5.2,clouds:0.9,veil:0.86,turbidity:0.55,exposure:1.2,bloom:0.07})},
+  original:{name:'Original Sunset',description:'The original modest sea and sunset lighting.',values:state({})},
+};
+const SEA_KEYS=Object.keys(DEFAULT_SEA);
+function crossingAngle(primary, secondary) { return ((secondary-primary+540)%360+360)%360-180; }
+// Blend spectrum coefficients through their parameters with fixed random seeds. No reseeding.
+function advanceSea(current,target,dt) {
+  const a=1-Math.exp(-Math.max(0,dt)/1.1);
+  let changed=false;
+  for(const key of SEA_KEYS) {
+    let d=key.endsWith('Dir') || key==='sunAzim' ? crossingAngle(current[key],target[key]) : target[key]-current[key];
+    if(Math.abs(d)<1e-4) { current[key]=target[key]; continue; }
+    changed=true; current[key]+=d*a;
+    if(key.endsWith('Dir')) current[key]=(current[key]%360+360)%360;
+  }
+  return changed;
+}
+function effectiveChop(p) {
+  const steep=Math.hypot(Math.PI*p.swellHs/(2*p.swellLength),Math.PI*p.swell2Hs/(2*p.swell2Length),0.06+0.005*p.windSpeed);
+  return Math.min(p.choppy,0.38/Math.max(steep*Math.sqrt(1+0.5*p.storm),0.1));
+}
+function seaBounds(p) {
+  const hs=Math.hypot(p.swellHs,p.swell2Hs,0.012*p.windSpeed*p.windSpeed)*Math.sqrt(1+0.5*p.storm);
+  const height=Math.max(4,hs*2.5+4);
+  return {height,horizontal:Math.max(4,height*effectiveChop(p)*0.8+4),hs};
+}
+function surfaceCameraY(y,water,guard,clearance,dt) {
+  const target=water+clearance;
+  const blend=1-Math.exp(-Math.max(0,dt)*(target>y?18:4));
+  return Math.max(guard+0.8,y+(target-y)*blend);
+}
+
+// Keep the last trustworthy surface if an extreme folded patch defeats inversion.
+// Neighbors with a poor inverse residual must not push the camera to a false crest.
+function updateSurfaceProbe(state,samples) {
+  if(samples.length!==8 || !samples.every(Number.isFinite)) return false;
+  let guard=-Infinity, valid=0, residual=0;
+  const centerValid=samples[4]>=0 && samples[4]<=0.05;
+  for(let k=0;k<4;k++) {
+    residual=Math.max(residual,samples[k+4]);
+    if(samples[k+4]>=0 && samples[k+4]<=0.05) { guard=Math.max(guard,samples[k]); valid++; }
+  }
+  if(centerValid) state.height=samples[0];
+  if(valid) state.guard=Math.max(guard,valid<4?state.guard:-Infinity);
+  state.residual=residual; state.rejected+=4-valid; state.centerValid=centerValid; state.validCount=valid;
+  return centerValid;
+}
+
+function initializeSurfaceProbe(state,fallbackHeight) {
+  if(state.centerValid) return;
+  if(!state.validCount) state.guard=fallbackHeight;
+  state.height=state.guard;
+}
+
 // ---- js/wgsl/common.js ----
 // Shared constants and WGSL snippets.
 const N = 256;          // FFT resolution per cascade
@@ -168,6 +247,8 @@ struct Frame {
   foamP:    vec4f,     // J threshold, J gain, foam intensity, lace sharpness
   fogExt:   vec4f,     // rgb extinction per metre near sea level
   cloudP:   vec4f,     // altitude km, coverage, optical density, wind time
+  stormP:   vec4f,     // intensity, sea mist, spindrift, combined nominal Hs
+  seaP:     vec4f,     // conservative vertical bound, effective chop, -, -
 };
 `;
 
@@ -280,7 +361,7 @@ fn gnoise(p: vec2f) -> f32 {
 
 // Periodic (tileable) noise for procedural textures. Requires NOISE_WGSL.
 const PERIODIC_WGSL = /* wgsl */ `
-fn pnoise(p: vec2f, period: i32) -> f32 {
+fn pnoiseRect(p: vec2f, period: vec2i) -> f32 {
   let i = vec2i(floor(p));
   let f = p - floor(p);
   let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
@@ -294,13 +375,16 @@ fn pnoise(p: vec2f, period: i32) -> f32 {
   let d = dot(hashGrad(i11), f - vec2f(1.0, 1.0));
   return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
-fn pfbm(p: vec2f, period: i32, oct: i32) -> f32 {
+fn pfbmRect(p: vec2f, period: vec2i, oct: i32) -> f32 {
   var s = 0.0; var a = 0.5; var q = p; var per = period;
   for (var o = 0; o < oct; o++) {
-    s += a * pnoise(q, per);
+    s += a * pnoiseRect(q, per);
     q *= 2.0; per *= 2; a *= 0.5;
   }
   return s;
+}
+fn pfbm(p: vec2f, period: i32, oct: i32) -> f32 {
+  return pfbmRect(p,vec2i(period),oct);
 }
 `;
 
@@ -324,6 +408,8 @@ struct Sim {
   swell:      vec4f,  // Hs m, direction rad, peak omega, spreading exponent
   misc:       vec4f,  // choppiness, short wave cut (m), loop period s, seed
   timeP:      vec4f,  // time (looped), dt, foam gain, spectrum gain
+  cross:      vec4f,  // secondary Hs, direction, peak omega, concentration
+  sea:        vec4f,  // storm intensity, swell peak gamma, -, -
 };
 @group(0) @binding(0) var<uniform> S: Sim;
 
@@ -383,11 +469,17 @@ fn cosSpread(theta: f32, s: f32) -> f32 {
   return q * pow(abs(cos(theta * 0.5)), 2.0 * s);
 }
 
-fn spectrum(k: vec2f) -> f32 {
+fn swellSpectrum(k: vec2f, w: f32, theta: f32, swell: vec4f) -> f32 {
+  if (swell.x < 0.001) { return 0.0; }
+  let gamma = S.sea.y;
+  let hs4 = swell.x * 0.25;
+  let alpha = hs4 * hs4 * 5.0 * pow(swell.z, 4.0) / (GRAV * GRAV) * (1.0 - 0.287 * log(gamma));
+  return jonswap(w, swell.z, alpha, gamma) * cosSpread(wrapAngle(theta - swell.y), swell.w);
+}
+fn spectrum(k: vec2f) -> vec3f {
   let kl = length(k);
   let w = omegaOf(kl);
   let theta = atan2(k.y, k.x);
-  // fetch-limited wind sea (JONSWAP)
   let U = S.wind.x;
   let F = S.wind.z;
   var Sw = 0.0;
@@ -396,29 +488,27 @@ fn spectrum(k: vec2f) -> f32 {
     let wp = 22.0 * pow(GRAV * GRAV / (U * F), 1.0 / 3.0);
     Sw = jonswap(w, wp, alpha, S.wind.w) * donelanBanner(wrapAngle(theta - S.wind.y), w, wp);
   }
-  // swell: narrow, long-crested JONSWAP
-  if (S.swell.x > 0.001) {
-    let ws = S.swell.z;
-    let gs = 6.0;
-    let hs4 = S.swell.x * 0.25;
-    let alphaS = hs4 * hs4 * 5.0 * ws * ws * ws * ws / (GRAV * GRAV) * (1.0 - 0.287 * log(gs));
-    Sw += jonswap(w, ws, alphaS, gs) * cosSpread(wrapAngle(theta - S.swell.y), S.swell.w);
-  }
+  var energy = vec3f(Sw, swellSpectrum(k,w,theta,S.swell), swellSpectrum(k,w,theta,S.cross));
   // damp the very shortest waves
   let sc = S.misc.y;
-  Sw *= exp(-kl * kl * sc * sc);
-  return Sw * dOmegaOf(kl) / kl * S.timeP.w;
+  energy *= exp(-kl * kl * sc * sc);
+  return energy * dOmegaOf(kl) / kl * S.timeP.w;
 }
 
-fn amplitude(k: vec2f, c: u32) -> f32 {
+fn amplitude(k: vec2f, c: u32) -> vec3f {
   let kl = length(k);
-  if (kl < 1e-5 || kl < S.kMin[c >> 2u][c & 3u] || kl >= S.kMax[c >> 2u][c & 3u]) { return 0.0; }
+  if (kl < 1e-5 || kl < S.kMin[c >> 2u][c & 3u] || kl >= S.kMax[c >> 2u][c & 3u]) { return vec3f(0.0); }
   let dk = 2.0 * PI / S.L[c >> 2u][c & 3u];
   // the finest cascades are toned down (they otherwise read as crumpled foil)
   let g = select(1.0, select(0.85, 0.6, c == 5u), c >= 4u);
-  return sqrt(max(spectrum(k), 0.0)) * dk * 0.5 * g;
+  return sqrt(max(spectrum(k), vec3f(0.0))) * dk * 0.5 * g;
 }
 
+fn seededAmplitude(k: vec2f, c: u32, seed: u32) -> vec2f {
+  let a = amplitude(k,c);
+  // Independent phases keep an existing swell intact as another swell is introduced.
+  return gauss2(seed)*a.x + gauss2(seed+15485863u)*a.y + gauss2(seed+32452843u)*a.z;
+}
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) id: vec3u) {
   let c = id.z;
@@ -427,8 +517,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let mx = (N - id.x) % N;
   let my = (N - id.y) % N;
   let seed = u32(S.misc.w) * 7919u + c * 1000003u;
-  let a = gauss2(seed + (id.y * N + id.x)) * amplitude(k, c);
-  let b = gauss2(seed + (my * N + mx)) * amplitude(-k, c);
+  let a = seededAmplitude(k,c,seed + id.y*N + id.x);
+  // Use the exact canonical partner, including +0 on frequency axes. Evaluating -k
+  // may change atan2 signed-zero behavior and leak imaginary height into packed Jxz.
+  let mirroredK=waveVec(mx,my,L);
+  let b = seededAmplitude(mirroredK,c,seed + my*N + mx);
   h0[(c * N + id.y) * N + id.x] = vec4f(a, b.x, -b.y);
 }
 `;
@@ -457,7 +550,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   // h0(k) travels along +k: h(k,t) = h0(k) e^{-iwt} + conj(h0(-k)) e^{iwt}
   let h = cmul(H0.xy, vec2f(e.x, -e.y)) + cmul(H0.zw, e);
   let ih = mulI(h);
-  let lam = S.misc.x;
+  // Short capillary bands retain full height/slope detail, but do not inherit the
+  // enormous horizontal steepening of storm swells (avoids folded micro-geometry).
+  let lam = S.misc.x/(1.0+0.45*S.sea.x*f32(c));
   let ik = 1.0 / kl;
   let Dx = ih * (lam * k.x * ik);
   let Dz = ih * (lam * k.y * ik);
@@ -629,7 +724,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let fineD = pfbm(uv * 16.0, 16, 3) * 0.5 + 0.5;
   let big = m1 * (0.55 + 0.45 * m2) * (0.75 + 0.25 * b3);
   let fine = 0.45 + 0.55 * b3 * (0.7 + 0.3 * b4);
-  let streak = pfbm(uv * vec2f(4.0, 16.0), 4, 5) * 0.5 + 0.5;
+  // Wrap each axis at its own frequency: a scalar period repeated Y four times.
+  let streak = pfbmRect(uv * vec2f(4.0, 16.0), vec2i(4,16), 5) * 0.5 + 0.5;
   textureStore(dst, id.xy, vec4f(clamp(big * 0.6 + dens * 0.4, 0.0, 1.0), clamp(fine * 0.8 + fineD * 0.2, 0.0, 1.0), dens, streak));
 }
 `;
@@ -660,6 +756,7 @@ struct FoamU {
   cascL: array<vec4f, 2>,
   cascInvL: array<vec4f, 2>,
   drift: vec4f,              // foam drift velocity (m/s) xz
+  sea: vec4f,                // storm, nominal combined Hs, -, -
 };
 @group(0) @binding(0) var<uniform> U: FoamU;
 @group(0) @binding(1) var prevTex: texture_2d_array<f32>;
@@ -682,6 +779,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let inPrev = all(g >= plo) && all(g < plo + vec2i(RES));
   let p = (vec2f(g) + 0.5) * ts;
   var jxx = 0.0; var jzz = 0.0; var jxz = 0.0;
+  var height = 0.0; var slope = vec2f(0.0);
   for (var c = 0u; c < ${CASCADES}u; c++) {
     let texel = U.cascL[c >> 2u][c & 3u] / ${N}.0;
     let lod = log2(max(ts / texel, 1.0));
@@ -690,6 +788,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       let d = textureSampleLevel(derivTex, samp, uv, c, lod);
       let a = textureSampleLevel(dispTex, samp, uv, c, lod);
       jxx += d.z; jzz += d.w; jxz += a.w;
+      height += a.y; slope += d.xy;
     }
   }
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
@@ -700,7 +799,10 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     prev = textureSampleLevel(prevTex, sampPrev, back, lvl, 0.0);
   }
   let dt = U.p0.z;
-  let inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  let steepCrest = smoothstep(0.28,0.8,length(slope)) * smoothstep(0.02,0.28,height/max(U.sea.y,1.0));
+  // Elevation alone painted entire wave faces white. A steep crest enhances
+  // actual compression, but cannot independently spawn a sheet of foam.
+  let inject = clamp((U.p1.x-J)*U.p1.y,0.0,1.0) * (1.0+steepCrest*min(U.sea.x,1.0)*0.25);
   var f = prev.r * exp(-dt * U.p0.w);
   f = max(f, inject);
   f = min(f + inject * dt * U.p1.z, 1.6);
@@ -949,7 +1051,8 @@ fn skyViewUV(dir: vec3f) -> vec2f {
 }
 
 fn skyAtmo(dir: vec3f) -> vec3f {
-  return textureSampleLevel(skyLUT, sampC, skyViewUV(dir), 0.0).rgb * F.sunDir.w;
+  let weather=min(F.stormP.x,1.0);
+  return textureSampleLevel(skyLUT,sampC,skyViewUV(dir),0.0).rgb*F.sunDir.w * mix(vec3f(1.0),vec3f(0.73,0.85,1.02),weather);
 }
 `;
 
@@ -983,21 +1086,24 @@ fn cloudFbm(p: vec2f, fp: f32, oct: i32, billow: f32) -> f32 {
 // Signed "edge" functions (cloud where > 0) and their density ramps. The edge value is
 // what the sky pass differentiates (fwidth) to anti-alias the cloud silhouettes analytically.
 fn lowEdge(q: vec2f, fp: f32, oct: i32) -> f32 {
-  let t = F.cloudP.w;
+  let t = F.cloudP.w*(1.0+F.stormP.x*1.8);
   var p = q * 0.38 + vec2f(t * 0.004, t * 0.0012);
   let w = vec2f(gnoise(p * 0.3 + vec2f(1.7, 9.2)), gnoise(p * 0.3 + vec2f(8.3, 2.8)));
   p += w * 1.4;
   // slightly elongated cells (cloud streets), mildly billowy small scales for ragged edges
-  let base = cloudFbm(p * vec2f(1.0, 1.7), fp * 0.65, oct, 0.35) * 1.3 + 0.5;
-  let large = gnoise(q * 0.05 + vec2f(3.1, 1.3)) * 0.7;
-  return base + large - (1.0 - F.cloudP.y);
+  let base = cloudFbm(p * vec2f(1.0, 1.7), fp * 0.65, oct, mix(0.35,0.72,min(F.stormP.x,1.0))) * 1.3 + 0.5;
+  let weather=min(F.stormP.x,1.0);
+  let large = gnoise(q * 0.05 + vec2f(3.1, 1.3)) * mix(0.7,1.35,weather);
+  return base + large - (1.0 - F.cloudP.y) - weather*0.08;
 }
-fn lowSoft(fp: f32) -> f32 { return 0.38 + min(fp * 0.65, 1.0) * 0.3; }
+// Retain density variation at high coverage instead of clamping the storm deck
+// to a uniformly opaque plane before its lighting is evaluated.
+fn lowSoft(fp: f32) -> f32 { return mix(0.38,0.85,min(F.stormP.x,1.0)) + min(fp * 0.65, 1.0) * 0.3; }
 fn lowDensity(q: vec2f, fp: f32, oct: i32) -> f32 {
   return clamp(lowEdge(q, fp, oct) / lowSoft(fp), 0.0, 1.0);
 }
 fn highEdge(q: vec2f, fp: f32, oct: i32) -> f32 {
-  let t = F.cloudP.w;
+  let t = F.cloudP.w*(1.0+F.stormP.x*1.8);
   // altostratus deck: smooth, slightly fibrous
   let p = CLOUD_ROT * (q * vec2f(0.09, 0.20)) + vec2f(t * 0.0015, 0.0);
   let n = cloudFbm(p, fp * 0.2, oct, 0.0) * 1.25 + 0.5;
@@ -1023,9 +1129,10 @@ fn hitLayer(dir: vec3f, hc: f32) -> CloudHit {
 
 // d: density at the hit; s1..s3: densities 80 m / 250 m / 600 m towards the sun
 fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f32, sigma: f32, g: f32) -> vec4f {
-  let tau = d * sigma / h.mu;
+  let optical=sigma*(1.0+F.stormP.x*0.9);
+  let tau = d * optical / h.mu;
   let alpha = 1.0 - exp(-tau);
-  let tauS = (d * 0.5 + s1 * 0.6 + s2 + s3 * 0.7) * sigma * 0.55;
+  let tauS = (d * 0.5 + s1 * 0.6 + s2 + s3 * 0.7) * optical * 0.55;
   let Ts = exp(-tauS);
   let sunC = sampleTrans(RG + hc, dot(h.up, F.sunDir.xyz)) * F.sunDir.w;
   let cosT = dot(dir, F.sunDir.xyz);
@@ -1041,8 +1148,8 @@ fn shadeLayer(dir: vec3f, h: CloudHit, hc: f32, d: f32, s1: f32, s2: f32, s3: f3
   let ms = sunC * (0.025 + 0.22 * rim) * mix(1.0, Ts, 0.5) * alpha * (0.25 + 0.75 * toward);
   // bases are lit by the sky from the sides/below (horizon band + sea), cooler than the tops
   let amb = (skyAtmo(normalize(vec3f(dir.x, 0.03, dir.z))) * 0.26 + skyAtmo(vec3f(0.0, 1.0, 0.0)) * 0.42)
-            * alpha * (1.0 - 0.35 * d);
-  return vec4f(single + ms + amb, alpha);
+            * alpha * (1.0 - mix(0.35,0.65,min(F.stormP.x,1.0)) * d);
+  return vec4f(single + ms + amb*(1.0-0.6*min(F.stormP.x,1.0)), alpha);
 }
 
 // returns (premultiplied radiance, fraction of the background sky hidden)
@@ -1058,7 +1165,7 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
     let hc = F.cloudP.x;
     let h = hitLayer(dir, hc);
     // clear band near the horizon, where the low sun shines under the clouds
-    let far = 1.0 - smoothstep(18.0, 36.0, h.t);
+    let far = 1.0-smoothstep(mix(18.0,55.0,min(F.stormP.x,1.0)),mix(36.0,95.0,min(F.stormP.x,1.0)),h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
       let e = lowEdge(h.q, fp, 7);
@@ -1072,7 +1179,8 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
         // spread it over ~1.5 pixels
         let aw = select(fp * 0.38 * 2.5, aa.x, aa.x >= 0.0);
         lo *= smoothstep(0.0, aw * 1.5 + 1e-6, e);
-        loVis = exp(-h.t * 0.02 * (0.6 + 0.4 * F.atmo.x));
+        // A storm's low ceiling must remain visible through the horizon haze.
+        loVis = exp(-h.t * 0.02 * (0.6 + 0.4 * F.atmo.x) * mix(1.0,0.28,min(F.stormP.x,1.0)));
       }
     }
   }
@@ -1081,7 +1189,7 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
   if (F.atmo.z > 0.001) {
     let hc = 4.5;
     let h = hitLayer(dir, hc);
-    let far = 1.0 - smoothstep(30.0, 70.0, h.t);
+    let far = 1.0 - smoothstep(mix(30.0,80.0,min(F.stormP.x,1.0)),mix(70.0,160.0,min(F.stormP.x,1.0)),h.t);
     if (far > 0.0) {
       let fp = h.t * pixAng / h.mu;
       let e = highEdge(h.q, fp, 6);
@@ -1092,7 +1200,7 @@ fn cloudLayers(dir: vec3f, pixAng: f32, aa: vec2f, sunT: ptr<function, f32>) -> 
         hi = shadeLayer(dir, h, hc, d, s1, s2, s2, F.atmo.w, 0.80);
         let aw = select(fp * 0.2 * 2.5, aa.y, aa.y >= 0.0);
         hi *= smoothstep(0.0, aw * 1.5 + 1e-6, e);
-        hiVis = exp(-h.t * 0.010 * (0.6 + 0.4 * F.atmo.x));
+        hiVis = exp(-h.t * 0.010 * (0.6 + 0.4 * F.atmo.x) * mix(1.0,0.55,min(F.stormP.x,1.0)));
       }
     }
   }
@@ -1295,7 +1403,7 @@ struct VSOut {
   var xz = inst.xy + g * spacing;
   // CDLOD morph towards the next coarser level
   let R = F.lodP.x * exp2(inst.w);
-  let d = distance(vec3f(xz.x, 0.0, xz.y), F.camPos.xyz);
+  let d = length(vec3f(xz-F.camPos.xz,max(abs(F.camPos.y)-F.seaP.x,0.0)));
   let mk = clamp((d - 0.8 * R) / (0.2 * R), 0.0, 1.0);
   xz -= fract(g * 0.5) * 2.0 * spacing * mk;
   let eff = spacing * (1.0 + mk);
@@ -1363,23 +1471,33 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     cov += vec3f(max(mv.x - dv.x * dv.x, 0.0), max(mv.y - dv.y * dv.y, 0.0), mv.z - dv.x * dv.y);
   }
   let dist = length(in.rel);
-  let V = -in.rel / dist;
+  let V = -in.rel / max(dist,0.001);
   let Ld = F.sunDir.xyz;
 
   // slope statistics (LEAN): add unresolved capillary roughness + sun disk size
   // unresolved roughness; grows with distance to reach Cox-Munk-like totals in the far sheen
   let unres = F.waterCol.w + 0.0035 * smoothstep(30.0, 500.0, dist);
-  cov.x += unres;
-  cov.y += unres;
   let jx = max(1.0 + jxx, 0.15);
   let jz = max(1.0 + jzz, 0.15);
-  let sl = vec2f(s.x / jx, s.y / jz);
+  let slopeDet = max(jx*jz-jxz*jxz,0.12);
+  let sl = clamp(vec2f(s.x*jz-s.y*jxz,s.y*jx-s.x*jxz)/slopeDet,vec2f(-12.0),vec2f(12.0));
+  // LEAN moments are in undisplaced coordinates, just like s. Transform their
+  // covariance by the same inverse Jacobian so compressed detail is filtered
+  // with its actual world-space variance instead of becoming thin bright ridges.
+  let inverseJ=vec3f(jz,jx,-jxz)/slopeDet;
+  let transformed=vec3f(
+    inverseJ.x*inverseJ.x*cov.x+inverseJ.z*inverseJ.z*cov.y+2.0*inverseJ.x*inverseJ.z*cov.z,
+    inverseJ.z*inverseJ.z*cov.x+inverseJ.y*inverseJ.y*cov.y+2.0*inverseJ.y*inverseJ.z*cov.z,
+    inverseJ.x*inverseJ.z*cov.x+inverseJ.y*inverseJ.z*cov.y+(inverseJ.x*inverseJ.y+inverseJ.z*inverseJ.z)*cov.z);
+  cov=vec3f(max(transformed.xy,vec2f(0.0)),transformed.z);
+  cov.x+=unres; cov.y+=unres;
+  cov.z=clamp(cov.z,-sqrt(cov.x*cov.y)*0.995,sqrt(cov.x*cov.y)*0.995);
   let nrm = normalize(vec3f(-sl.x, 1.0, -sl.y));
   // specular anti-aliasing: slope variation across the pixel widens the lobe
   let dsx = dpdx(sl);
   let dsy = dpdy(sl);
   let aa = vec3f(dsx.x * dsx.x + dsy.x * dsy.x, dsx.y * dsx.y + dsy.y * dsy.y, dsx.x * dsx.y + dsy.x * dsy.y) * 0.5;
-  cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
+  cov += aa * min(1.0, mix(0.03,0.12,min(F.stormP.x,1.0)) / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
   let sunE = sunIlluminance() * sunVis[0];
@@ -1411,7 +1529,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let sig = sqrt(max(cov.x + cov.y, 1e-6) * 0.5);
   let vh = normalize(vec3f(V.x, 0.0, V.z) + vec3f(1e-5, 0.0, 0.0));
   let sigV = sqrt(max(vh.x * vh.x * cov.x + vh.z * vh.z * cov.y + 2.0 * vh.x * vh.z * cov.z, 1e-6));
-  let aV = max(V.y, 1e-3) / max(sqrt(1.0 - V.y * V.y), 1e-3) / (1.4142 * sigV);
+  let aV = max(V.y, 1e-3) / max(sqrt(max(1.0 - V.y * V.y,0.0)), 1e-3) / (1.4142 * sigV);
   let tilt = 0.32 * sigV * (1.0 - smoothstep(0.0, 2.5, aV));
   let nV = normalize(nrm + vh * tilt);
   var R = reflect(-V, nV);
@@ -1431,7 +1549,7 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   // upwelling light is diffuse: light it with smooth terms only (no per-pixel normal noise)
   var body = F.waterCol.rgb * (skyHemi * 1.6 + sunE * max(Ld.y, 0.0) * 0.8);
   // light transmitted through the thin upper part of backlit crests
-  let crest = clamp((in.height - 0.05) / 0.9, 0.0, 1.0);
+  let crest = clamp((in.height-0.05)/max(0.9,F.stormP.w*0.35),0.0,1.0);
   let toSun = max(dot(Ld, -V), 0.0);
   let thin = pow(clamp(0.5 - 0.5 * dot(Ld, nrm), 0.0, 1.0), 3.0);
   let k1 = F.sssCol.w * crest * crest * pow(toSun, 4.0) * thin * exp(-dist / 600.0);
@@ -1448,13 +1566,16 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let fw1 = textureSample(foamWorld, sampR, xz / F.lodP.w, 1u);
   let fwl = mix(fw1, fw0, w0) * w1;
   let fresh = clamp((F.foamP.x - J) * F.foamP.y, 0.0, 1.0);
-  var cover = clamp((max(fwl.r, fresh * (1.0 - w1 * 0.7)) + fwl.g * 0.6) * F.foamP.z, 0.0, 1.5);
+  let foamStrength=max(F.foamP.z,0.0);
+  // Freshness changes the core's appearance, rather than counting the same
+  // injected foam a second time. Zero strength disables every foam contribution.
+  var cover=1.0-exp(-max(fwl.r,fresh*(1.0-w1*0.7))*foamStrength*0.65);
   // aged foam breaks into wind-aligned streaks; fresh crest foam stays dense
   let wd = F.windP[0].xy;
   let ws = vec2f(dot(xz, wd), dot(xz, vec2f(-wd.y, wd.x)));
-  let streak = textureSample(foamTex, sampR, ws * vec2f(0.035, 0.11)).a;
+  let streak = textureSample(foamTex, sampR, ws * vec2f(0.018, 0.045)+vec2f(gustN*0.13,-gustN*0.09)).a;
   let freshK = clamp(fwl.g * 2.0 + fresh, 0.0, 1.0);
-  cover *= mix(smoothstep(0.25, 0.75, streak) * 1.5, 1.0, freshK);
+  cover *= mix(mix(0.55,1.15,smoothstep(0.2,0.8,streak)),1.0,freshK);
   let pat = foamPattern(xz, F.camPos.w);
   let fw = fwidth(pat) + 0.03;
   // soft threshold: thin foam is a translucent film, dense foam is opaque white
@@ -1463,10 +1584,10 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   let fm = smoothstep(1.0 - cover - fw - soft, 1.0 - cover + fw + soft, pat);
   var foamMask = clamp(fm * smoothstep(0.0, 0.5, cover), 0.0, 1.0) * (0.68 + 0.32 * smoothstep(0.3, 0.9, cover));
   // freshly broken crests: dense, almost opaque core
-  foamMask = max(foamMask, smoothstep(0.35, 0.9, fwl.g) * smoothstep(0.25, 0.6, pat + 0.25) * 0.95);
+  foamMask = max(foamMask, smoothstep(0.6, 1.0, fwl.g) * smoothstep(0.45, 0.75, pat + 0.1) * 0.85 * min(foamStrength,1.0));
   // submerged bubbles brighten and tint the water just beneath foam
   body += F.sssCol.rgb * (sunE * 0.05 + ambient * 0.35) * clamp(cover, 0.0, 1.0);
-  body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35;
+  body += vec3f(0.10, 0.32, 0.30) * skyUp * fwl.g * 0.35 * min(foamStrength,1.0);
   // bubbly brightness variation inside the foam
   let bub = textureSample(foamTex, sampR, xz * 1.9 + vec2f(0.21, 0.53)).g;
   let foamAlb = vec3f(0.82, 0.87, 0.92) * (0.78 + 0.3 * bub);
@@ -1487,6 +1608,8 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
     if (F.post.w > 6.5 && F.post.w < 7.5) { return vec4f(skyUp, 1.0); }
     return vec4f(fwl.r, fwl.g, fresh, 1.0) * 0.2;
   }
+  // Crest/trough contrast follows resolved wave height, not a displacement multiplier.
+  body *= mix(1.0, mix(0.5,1.12,smoothstep(-0.25,0.3,in.height/max(F.stormP.w,1.0))),min(F.stormP.x,1.0));
   var col = body * (1.0 - Fr) + refl * Fr + spec;
   col = mix(col, foamLit, foamMask * 0.95);
 
@@ -1506,23 +1629,40 @@ const HEIGHT_PROBE = FRAME_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
 @group(0) @binding(1) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(2) var samp: sampler;
-@group(0) @binding(3) var<storage, read_write> outH: array<f32, 4>;
-fn dispAt(xz: vec2f) -> vec3f {
-  var d = vec3f(0.0);
-  for (var c = 0u; c < ${CASCADES}u; c++) {
-    d += textureSampleLevel(dispTex, samp, xz * F.cascInvL[c >> 2u][c & 3u], c, 0.0).xyz;
+@group(0) @binding(3) var<storage, read_write> outH: array<f32, 8>;
+@group(0) @binding(4) var derivTex: texture_2d_array<f32>;
+struct Surface { d: vec3f, j: vec3f };
+fn surfaceAt(xz: vec2f) -> Surface {
+  var r: Surface;
+  for (var c=0u;c<${CASCADES}u;c++) {
+    let uv=xz*F.cascInvL[c>>2u][c&3u];
+    let a=textureSampleLevel(dispTex,samp,uv,c,0.0);
+    let b=textureSampleLevel(derivTex,samp,uv,c,0.0);
+    r.d+=a.xyz; r.j+=vec3f(b.z,b.w,a.w);
   }
-  return d;
+  return r;
 }
-@compute @workgroup_size(1)
-fn main() {
-  let goal = F.camPos.xz;
-  var x0 = goal;
-  for (var i = 0; i < 4; i++) {
-    let d = dispAt(x0);
-    x0 = goal - d.xz;
+@compute @workgroup_size(4)
+fn main(@builtin(local_invocation_index) k: u32) {
+  let offsets=array<vec2f,4>(vec2f(0.0),vec2f(0.6,0.0),vec2f(-0.3,0.52),vec2f(-0.3,-0.52));
+  let goal=F.camPos.xz+offsets[k];
+  var x=goal;
+  var bestX=x; var bestError=1e20;
+  for(var i=0;i<16;i++) {
+    let r=surfaceAt(x);
+    let residual=x+r.d.xz-goal;
+    let error=length(residual);
+    if(error<bestError) { bestError=error; bestX=x; }
+    if(error<0.002) { break; }
+    let ax=1.0+r.j.x; let az=1.0+r.j.y; let crossJ=r.j.z;
+    let det=ax*az-crossJ*crossJ;
+    var step=residual*0.4;
+    if(det>0.12) { step=vec2f(az*residual.x-crossJ*residual.y,ax*residual.y-crossJ*residual.x)/det; }
+    x-=step*(min(1.0,8.0/max(length(step),0.001))*0.8);
   }
-  outH[0] = dispAt(x0).y;
+  var result=surfaceAt(x);
+  if(length(x+result.d.xz-goal)>bestError) { x=bestX; result=surfaceAt(x); }
+  outH[k]=result.d.y; outH[k+4u]=length(x+result.d.xz-goal);
 }
 `;
 
@@ -1658,11 +1798,62 @@ fn ign(p: vec2f) -> f32 { return fract(52.9829189 * fract(dot(p, vec2f(0.0671105
 }
 `;
 
+// ---- js/wgsl/spray.js ----
+// Bounded, procedural crest spindrift: 256 camera-near cards, no particle buffers/integration.
+
+const SPINDRIFT = FRAME_WGSL + /* wgsl */ `
+@group(0) @binding(0) var<uniform> F: Frame;
+@group(0) @binding(1) var dispTex: texture_2d_array<f32>;
+@group(0) @binding(2) var derivTex: texture_2d_array<f32>;
+@group(0) @binding(3) var samp: sampler;
+@group(0) @binding(4) var detail: texture_2d<f32>;
+fn hash(n: u32) -> f32 {
+  var x=n*747796405u+2891336453u; x=((x>>((x>>28u)+4u))^x)*277803737u;
+  return f32((x>>22u)^x)/4294967296.0;
+}
+struct VO { @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) alpha: f32 };
+@vertex fn vs(@builtin(vertex_index) v: u32,@builtin(instance_index) i: u32) -> VO {
+  let corners=array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
+  let cell=vec2i(floor(F.camPos.xz/10.0))+vec2i(i32(i%16u)-8,i32(i/16u)-8);
+  let seed=bitcast<u32>(cell.x)*1664525u+bitcast<u32>(cell.y)*1013904223u;
+  let q=(vec2f(cell)+vec2f(hash(seed),hash(seed+13u)))*10.0;
+  var d=vec3f(0); var j=vec3f(0); var slope=vec2f(0);
+  for(var c=0u;c<${CASCADES}u;c++) {
+    let uv=q*F.cascInvL[c>>2u][c&3u];
+    let a=textureSampleLevel(dispTex,samp,uv,c,1.0);
+    let b=textureSampleLevel(derivTex,samp,uv,c,1.0);
+    d+=a.xyz; j+=vec3f(b.z,b.w,a.w); slope+=b.xy;
+  }
+  let J=(1.0+j.x)*(1.0+j.y)-j.z*j.z;
+  let crest=smoothstep(0.04,0.32,d.y/max(F.stormP.w,1.0));
+  let crestActivity=max(clamp((0.8-J)*2.0,0.0,1.0),smoothstep(0.25,0.8,length(slope)))*crest;
+  let age=fract(F.camPos.w*0.35+hash(seed+71u));
+  let corner=corners[v];
+  let radius=(0.8+F.stormP.x*1.1)*(0.7+hash(seed+3u));
+  let right=normalize(F.camRight.xyz); let up=normalize(F.camUp.xyz);
+  let lift=vec3f(F.windP[0].x*age*2.0,age*(1.0+F.stormP.x*3.0),F.windP[0].y*age*2.0);
+  let world=vec3f(q.x+d.x,d.y+0.5,q.y+d.z)+lift+right*corner.x*radius+up*corner.y*radius*1.5;
+  var o:VO; o.pos=F.viewProj*vec4f(world-F.camPos.xyz,1.0); o.uv=corner*0.5+0.5;
+  o.alpha=crestActivity*F.stormP.z*sin(age*3.14159265)*0.23;
+  return o;
+}
+@fragment fn fs(in:VO) -> @location(0) vec4f {
+  let p=in.uv*2.0-1.0;
+  let soft=pow(max(0.0,1.0-dot(p,p)),2.0);
+  let lace=textureSample(detail,samp,in.uv*0.7+vec2f(F.camPos.w*0.015,0.0)).r;
+  let alpha=in.alpha*soft*smoothstep(0.12,0.75,lace);
+  let light=vec3f(0.16,0.2,0.24)*(F.sunDir.w/10.0);
+  return vec4f(light*alpha,alpha);
+}
+`;
+
 // ---- js/main.js ----
 // WebGPU ocean — custom renderer.
 // FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post.
 // Normal frames reuse uniform arrays and most descriptors. Optional diagnostics collect
 // samples; WebGPU swap-chain views and command buffers are necessarily transient.
+
+
 
 
 
@@ -1676,25 +1867,8 @@ const D2R = Math.PI / 180;
 // ----------------------------------------------------------------------------------------
 // Tunable parameters (UI panel edits these)
 // ----------------------------------------------------------------------------------------
-const P = {
-  windSpeed: 7.0,      // m/s at 10 m
-  windDir: 118,        // deg, direction waves travel (90 = towards +Z, i.e. towards the viewer)
-  fetchKm: 90,
-  swellHs: 1.8,        // m significant height
-  swellDir: 94,
-  swellLength: 120,    // m peak wavelength
-  swellSpread: 48,     // cos^2s exponent
-  choppy: 1.25,
-  turbidity: 1.6,     // water body brightness (coastal sediment / plankton)
-  foam: 1.0,
-  sunElev: 2.6,        // deg
-  sunAzim: 4,          // deg (0 = straight ahead of the start view)
-  exposure: 1.35,
-  haze: 3.0,
-  clouds: 0.40,
-  veil: 0.36,
-  bloom: 0.10,
-};
+const P = { ...STORM_PRESETS[qs.get('preset')]?.values || STORM_PRESETS.original.values };
+let activePreset = STORM_PRESETS[qs.get('preset')] ? qs.get('preset') : 'original';
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
 function fail(msg) {
@@ -1779,7 +1953,7 @@ async function main() {
   const SIM_MIP_COUNT = Math.log2(N) + 1;
   const specBytes = N * N * C * 16;
   const mkBuf = (size, usage, label) => device.createBuffer({ size, usage, label });
-  const simUBO = mkBuf(224, GU.UNIFORM | GU.COPY_DST, 'sim ubo');
+  const simUBO = mkBuf(256, GU.UNIFORM | GU.COPY_DST, 'sim ubo');
   const h0Buf = mkBuf(specBytes, GU.STORAGE, 'h0');
   const specA = mkBuf(specBytes, GU.STORAGE, 'specA');
   const specB = mkBuf(specBytes, GU.STORAGE, 'specB');
@@ -1859,8 +2033,8 @@ async function main() {
     label: 'foam world ' + i, size: [FOAM_RES, FOAM_RES, 2], format: 'rgba16float', mipLevelCount: FOAMW_MIPS,
     usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
   }));
-  const foamUBO = mkBuf(144, GU.UNIFORM | GU.COPY_DST, 'foam ubo');
-  const foamUArr = new ArrayBuffer(144);
+  const foamUBO = mkBuf(160, GU.UNIFORM | GU.COPY_DST, 'foam ubo');
+  const foamUArr = new ArrayBuffer(160);
   const foamUI = new Int32Array(foamUArr);
   const foamUF = new Float32Array(foamUArr);
   const foamSnap = new Int32Array(4);  // previous camera texel per level
@@ -1900,7 +2074,7 @@ async function main() {
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear',
     addressModeU: 'repeat', addressModeV: 'repeat', maxAnisotropy: 16,
   });
-  const frameUBO = mkBuf(384, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
+  const frameUBO = mkBuf(416, GU.UNIFORM | GU.COPY_DST, 'frame ubo');
   const sunVisBuf = mkBuf(16, GU.STORAGE, 'sun visibility');
   const transView = transLUT.createView();
   const msView = msLUT.createView();
@@ -1925,12 +2099,12 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Render pipelines
   // --------------------------------------------------------------------------------------
-  let MSAA = qs.get('aa') === '1' ? 1 : 4;
+  let MSAA = qs.get('aa') === '4' ? 4 : 1;
   let fpsLimit = [30, 60].includes(Number(qs.get('fps'))) ? Number(qs.get('fps')) : 0;
   const HDR = 'rgba16float';
-  const [oceanMod, skyMod, downMod, upMod, compMod] = await Promise.all([
+  const [oceanMod, skyMod, downMod, upMod, compMod, sprayMod] = await Promise.all([
     shader(OCEAN, 'ocean'), shader(SKY_BG, 'sky'), shader(BLOOM_DOWN, 'bloom down'),
-    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'),
+    shader(BLOOM_UP, 'bloom up'), shader(COMPOSITE, 'composite'), shader(SPINDRIFT, 'crest spindrift'),
   ]);
   const oceanDesc = {
     label: 'ocean', layout: 'auto',
@@ -1951,15 +2125,24 @@ async function main() {
     depthStencil: { format: 'depth32float', depthWriteEnabled: false, depthCompare: 'equal' },
     multisample: { count: MSAA },
   };
+  const sprayDesc = {
+    label:'crest spindrift', layout:'auto', vertex:{module:sprayMod,entryPoint:'vs'},
+    fragment:{module:sprayMod,entryPoint:'fs',targets:[{format:HDR,blend:{
+      color:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'},
+      alpha:{srcFactor:'one',dstFactor:'one-minus-src-alpha',operation:'add'},
+    }}]}, primitive:{topology:'triangle-list'},
+    depthStencil:{format:'depth32float',depthWriteEnabled:false,depthCompare:'greater'},
+  };
   const pipelinePairs = new Map();
   async function scenePipelines(samples) {
     if (!pipelinePairs.has(samples)) pipelinePairs.set(samples, Promise.all([
       device.createRenderPipelineAsync({ ...oceanDesc, multisample: { count: samples } }),
       device.createRenderPipelineAsync({ ...skyDesc, multisample: { count: samples } }),
+      device.createRenderPipelineAsync({ ...sprayDesc, multisample: { count: samples } }),
     ]));
     return pipelinePairs.get(samples);
   }
-  let [oceanPipe, skyPipe] = await scenePipelines(MSAA);
+  let [oceanPipe, skyPipe, sprayPipe] = await scenePipelines(MSAA);
   const downPipe = await device.createRenderPipelineAsync({
     label: 'bloom down', layout: 'auto',
     vertex: { module: downMod, entryPoint: 'vs' },
@@ -1986,15 +2169,24 @@ async function main() {
   let bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
 
+  const sprayEntries = [{buffer:frameUBO},fullArr(dispTex),fullArr(derivTex),sampRepeat,foamTex.createView()];
+  let bgSpray = bg(sprayPipe,sprayEntries,'crest spindrift');
+
   // Water height under the camera (async readback, a few frames of latency) so the
   // floating camera rides above passing crests instead of clipping into them.
   const probePipe = await computePipe(HEIGHT_PROBE, 'height probe');
-  const probeOut = mkBuf(16, GU.STORAGE | GU.COPY_SRC, 'probe out');
-  const probeRead = mkBuf(16, GU.MAP_READ | GU.COPY_DST, 'probe read');
-  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }], 'probe');
-  let probePending = false, waterH = 0;
+  const probeOut = mkBuf(32, GU.STORAGE | GU.COPY_SRC, 'probe out');
+  const probeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'probe read');
+  const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }, fullArr(derivTex)], 'probe');
+  let probePending = false, waterH = 0, waterGuard = 0, probeResidual = 0;
+  const surfaceProbe={height:0,guard:0,residual:0,rejected:0,centerValid:false,validCount:0};
   const onProbe = () => {
-    waterH = new Float32Array(probeRead.getMappedRange(0, 16))[0];
+    const heights = new Float32Array(probeRead.getMappedRange(0,32));
+    if (heights.every(Number.isFinite)) {
+      updateSurfaceProbe(surfaceProbe,heights);
+      probeResidual=surfaceProbe.residual;
+      waterH=surfaceProbe.height; waterGuard=surfaceProbe.guard;
+    } else stopRenderer('Water-height probe returned a non-finite value.');
     probeRead.unmap();
     probePending = false;
   };
@@ -2135,8 +2327,8 @@ async function main() {
   // --------------------------------------------------------------------------------------
   // Uniform data
   // --------------------------------------------------------------------------------------
-  const simF = new Float32Array(56);
-  const frameF = new Float32Array(96);
+  const simF = new Float32Array(64);
+  const frameF = new Float32Array(104);
   const atmoF = new Float32Array(4);
   const proj = new Float32Array(16), view = new Float32Array(16), viewProj = new Float32Array(16);
   const LOOP = 600.0;  // s, spectrum time loop (frequencies quantised to it)
@@ -2150,21 +2342,27 @@ async function main() {
       simF[16 + c] = c < C - 1 ? (2 * Math.PI * 6) / CASC_L[c + 1] : (Math.PI * N / L) * 0.98; // kMax
     }
     for (let c = 1; c < C; c++) simF[8 + c] = simF[16 + c - 1];
-    simF[40] = P.windSpeed; simF[41] = P.windDir * D2R; simF[42] = P.fetchKm * 1000; simF[43] = 3.3;
-    const ks = 2 * Math.PI / P.swellLength;
-    simF[44] = P.swellHs; simF[45] = P.swellDir * D2R; simF[46] = Math.sqrt(9.81 * ks); simF[47] = P.swellSpread;
-    simF[48] = P.choppy; simF[49] = 0.0012; simF[50] = LOOP; simF[51] = 1;
-    simF[54] = 2.2; simF[55] = 1.0;
+    simF[40] = E.windSpeed; simF[41] = E.windDir * D2R; simF[42] = E.fetchKm * 1000; simF[43] = 3.3;
+    const ks = 2 * Math.PI / E.swellLength;
+    simF[44] = E.swellHs; simF[45] = E.swellDir * D2R; simF[46] = Math.sqrt(9.81 * ks); simF[47] = E.swellSpread;
+    simF[48] = effectiveChop(E); simF[49] = 0.0012; simF[50] = LOOP; simF[51] = 1;
+    simF[54] = 2.2; simF[55] = 1.0+0.5*E.storm;
+    simF[56]=E.swell2Hs; simF[57]=E.swell2Dir*D2R;
+    simF[58]=Math.sqrt(9.81*2*Math.PI/E.swell2Length); simF[59]=E.swell2Spread;
+    simF[60]=E.storm; simF[61]=E.peakGamma;
   }
 
   // --------------------------------------------------------------------------------------
   // Camera & input
   // --------------------------------------------------------------------------------------
   const cam = { x: 0, y: 2.4, z: 0, yaw: 0, pitch: -5.5 * D2R, fovY: 58 * D2R, speed: 6 };
+  let cameraMode=qs.get('camera')==='free'?'free':'surface';
+  let surfaceClearance=3.0;
   if (qs.get('cam')) {
     const v = qs.get('cam').split(',').map(Number);
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2]; cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
   }
+  if(qs.get('cam')) surfaceClearance=Math.max(0.9,cam.y);
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
   const touch = { fwd:0, str:0, up:0, boost:false };
@@ -2203,10 +2401,11 @@ async function main() {
     mz += -fwd * cp * cy + str * sy;
     const boost = keys.ShiftLeft || keys.ShiftRight || touch.boost ? 5 : 1;
     const v = cam.speed * boost * dt;
-    cam.x += mx * v; cam.y += my * v; cam.z += mz * v;
-    cam.y = Math.max(1.0, Math.min(3000, cam.y));
-    // keep clear of the actual (displaced) water surface under the camera
-    if (cam.y < waterH + 0.9) cam.y += (waterH + 0.9 - cam.y) * Math.min(1, dt * 12);
+    cam.x += mx * v; if(cameraMode!=='surface') cam.y += my*v; cam.z += mz * v;
+    if (cameraMode==='surface') {
+      surfaceClearance=Math.max(0.9,Math.min(3000,surfaceClearance+my*v));
+      cam.y=surfaceCameraY(cam.y,waterH,waterGuard,surfaceClearance,dt);
+    } else cam.y=Math.max(waterGuard+0.8,Math.min(3000,cam.y));
   }
 
   // --------------------------------------------------------------------------------------
@@ -2215,8 +2414,8 @@ async function main() {
   const ranges = new Float64Array(LODS);
   for (let l = 0; l < LODS; l++) ranges[l] = R0 * Math.pow(2, l);
   const planes = new Float64Array(16);
-  const HB = 4.0;   // vertical bound of displaced surface
-  const XB = 4.0;   // horizontal displacement margin for culling
+  let HB = 4.0;   // vertical bound of displaced surface
+  let XB = 4.0;   // horizontal displacement margin for culling
   let nodeCount = 0, ccx = 0, ccy = 0, ccz = 0;
 
   function sphereHit(x0, z0, size, r) {
@@ -2256,6 +2455,7 @@ async function main() {
     return true;
   }
   function selectAll() {
+    const bounds=seaBounds(E); HB=bounds.height; XB=bounds.horizontal;
     nodeCount = 0;
     ccx = cam.x; ccy = cam.y; ccz = cam.z;
     // side planes from the camera-relative view-projection (rows 3±0, 3±1)
@@ -2304,23 +2504,26 @@ async function main() {
     f[20] = rx * tanX; f[21] = ry * tanX; f[22] = rz * tanX; f[23] = 0;
     f[24] = ux * tanY; f[25] = uy * tanY; f[26] = uz * tanY; f[27] = 0;
     f[28] = fx; f[29] = fy; f[30] = fz; f[31] = 0;
-    const se = P.sunElev * D2R, sa = P.sunAzim * D2R;
-    f[32] = Math.sin(sa) * Math.cos(se); f[33] = Math.sin(se); f[34] = -Math.cos(sa) * Math.cos(se); f[35] = 14.0;
+    const se = E.sunElev * D2R, sa = E.sunAzim * D2R;
+    f[32] = Math.sin(sa) * Math.cos(se); f[33] = Math.sin(se); f[34] = -Math.cos(sa) * Math.cos(se); f[35] = 14.0*(1-0.25*Math.min(E.storm,1));
     f[36] = W; f[37] = H; f[38] = 1 / W; f[39] = 1 / H;
     for (let c = 0; c < C; c++) { f[40 + c] = CASC_L[c]; f[48 + c] = 1 / CASC_L[c]; }
-    f[56] = Math.cos(P.windDir * D2R); f[57] = Math.sin(P.windDir * D2R); f[58] = P.windSpeed;
+    f[56] = Math.cos(E.windDir * D2R); f[57] = Math.sin(E.windDir * D2R); f[58] = E.windSpeed;
     f[64] = R0; f[65] = GRID; f[66] = FOAM_LEVEL_SIZE[0]; f[67] = FOAM_LEVEL_SIZE[1];
-    f[68] = P.exposure; f[69] = P.bloom; f[70] = frameIndex; f[71] = DBG;
-    f[72] = P.haze; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = P.veil; f[75] = 0.9;
+    f[68] = E.exposure; f[69] = E.bloom; f[70] = frameIndex; f[71] = DBG;
+    f[72] = Math.round(E.haze*10)/10; f[73] = Math.max(cam.y, 10) * 0.001; f[74] = E.veil; f[75] = 0.9;
     // deep water body scatter colour (greenish coastal water), unresolved slope variance
-    f[76] = 0.016 * P.turbidity; f[77] = 0.080 * P.turbidity; f[78] = 0.096 * P.turbidity; f[79] = 0.0024;
+    f[76] = 0.016 * E.turbidity; f[77] = 0.080 * E.turbidity; f[78] = 0.096 * E.turbidity; f[79] = 0.0024;
     f[80] = 0.035; f[81] = 0.120; f[82] = 0.085; f[83] = 2.6;
-    f[84] = 0.36 + 0.12 * P.foam; f[85] = 2.5; f[86] = 1.0; f[87] = 1.0;
-    f[88] = (5.802e-3 + 4.40e-3 * P.haze) * 1e-3;
-    f[89] = (13.558e-3 + 4.40e-3 * P.haze) * 1e-3;
-    f[90] = (33.1e-3 + 4.40e-3 * P.haze) * 1e-3;
-    f[91] = 1.1e-4;
-    f[92] = 1.5; f[93] = P.clouds; f[94] = 2.2; f[95] = time;
+    f[84] = 0.46 + 0.04*E.storm; f[85] = 2.5; f[86] = E.foam; f[87] = 1.0;
+    f[88] = (5.802e-3 + 4.40e-3 * E.haze) * 1e-3;
+    f[89] = (13.558e-3 + 4.40e-3 * E.haze) * 1e-3;
+    f[90] = (33.1e-3 + 4.40e-3 * E.haze) * 1e-3;
+    f[91] = 1.1e-4+E.mist*0.0006;
+    f[92] = 1.5*(1.0-0.5*Math.min(E.storm,1)); f[93] = E.clouds; f[94] = 2.2+E.storm*0.8; f[95] = time;
+    const bounds=seaBounds(E);
+    f[96]=E.storm; f[97]=E.mist; f[98]=E.spray; f[99]=bounds.hs;
+    f[100]=bounds.height; f[101]=effectiveChop(E);
     device.queue.writeBuffer(frameUBO, 0, f);
   }
 
@@ -2334,13 +2537,16 @@ async function main() {
     if (!panel.classList.contains('hidden')) document.exitPointerLock?.();
   }
   const SLIDERS = [
-    ['windSpeed', 'Wind speed (m/s)', 2, 20, 0.1, 'spec'],
+    ...STORM_CONTROLS,
+    ['windSpeed', 'Wind speed (m/s)', 2, 55, 0.1, 'spec'],
     ['windDir', 'Wind direction (deg)', 0, 360, 1, 'spec'],
-    ['fetchKm', 'Fetch (km)', 5, 800, 1, 'spec'],
-    ['swellHs', 'Swell height (m)', 0, 4, 0.05, 'spec'],
-    ['swellLength', 'Swell wavelength (m)', 30, 300, 1, 'spec'],
+    ['fetchKm', 'Fetch (km)', 5, 1200, 1, 'spec'],
+    ['swellHs', 'Primary swell height (m)', 0, 48, 0.05, 'spec'],
+    ['swellLength', 'Primary wavelength (m)', 40, 700, 1, 'spec'],
     ['swellDir', 'Swell direction (deg)', 0, 360, 1, 'spec'],
-    ['choppy', 'Choppiness', 0, 1.6, 0.01, 'spec'],
+    ['swellSpread','Primary concentration',2,96,1,'spec'],
+    ['peakGamma','Swell peak sharpness',2,9,0.1,'spec'],
+    ['choppy', 'Choppiness', 0, 1.8, 0.01, 'spec'],
     ['turbidity', 'Water turbidity', 0.2, 3, 0.01, ''],
     ['foam', 'Foam', 0, 3, 0.01, ''],
     ['sunElev', 'Sun elevation (deg)', -2, 60, 0.1, ''],
@@ -2356,6 +2562,9 @@ async function main() {
     const v = Number(qs.get(k)), limits = SLIDERS.find((s) => s[0] === k);
     if (Number.isFinite(v)) P[k] = limits ? Math.max(limits[2], Math.min(limits[3], v)) : v;
   }
+  const E={...P};
+  const spectrumKeys=new Set(['windSpeed','windDir','fetchKm','swellHs','swellDir','swellLength','swellSpread','swell2Hs','swell2Dir','swell2Length','swell2Spread','choppy','peakGamma','storm']);
+  const spectrumPrevious={...E};
   const panelHeading = document.createElement('div');
   panelHeading.className = 'panel-heading';
   const panelTitle = document.createElement('span');
@@ -2370,14 +2579,16 @@ async function main() {
   panel.appendChild(panelHeading);
   const sliders = new Map(SLIDERS.map((entry) => [entry[0], entry]));
   const groupDefinitions = [
+    ['Storm & Extreme Seas',STORM_CONTROLS.map((s)=>s[0])],
     ['Wind', ['windSpeed', 'windDir', 'fetchKm']],
-    ['Waves', ['swellHs', 'swellLength', 'swellDir', 'choppy']],
+    ['Waves', ['swellHs', 'swellLength', 'swellDir','swellSpread','peakGamma', 'choppy']],
     ['Water', ['turbidity', 'foam']],
     ['Sky & Atmosphere', ['sunElev', 'sunAzim', 'haze', 'clouds', 'veil']],
     ['Graphics & Performance', ['exposure', 'bloom']],
   ];
   const categoryElements = [];
-  let graphicsControls;
+  let graphicsControls, stormControls;
+  const sliderViews=new Map();
   for (const [category, keysInGroup] of groupDefinitions) {
     const section = document.createElement('details');
     section.className = 'settings-category';
@@ -2386,6 +2597,7 @@ async function main() {
     const controls = document.createElement('div');
     controls.className = 'category-controls';
     if (category === 'Graphics & Performance') graphicsControls = controls;
+    if (category === 'Storm & Extreme Seas') stormControls=controls;
     for (const key of keysInGroup) {
       const [sliderKey, label, min, max, step, kind] = sliders.get(key);
       const row = document.createElement('label');
@@ -2397,12 +2609,14 @@ async function main() {
       Object.assign(inp, { type:'range', min, max, step, value:P[sliderKey] });
       inp.addEventListener('input', () => {
         cancelRecording('Measurement cancelled: environment changed.');
-        P[sliderKey] = Number(inp.value);
+        P[sliderKey] = Number(inp.value); activePreset='custom'; presetSelect.value='custom';
+        presetDescription.textContent='Custom sea state · parameters blend smoothly.'; syncCrossAngle();
         val.textContent = inp.value;
         if (kind === 'spec') needSpectrum = true;
         if (kind === 'lut') needLUT = true;
         if (['sunElev','sunAzim','haze','clouds','veil','turbidity'].includes(sliderKey)) envFull = 2;
       });
+      sliderViews.set(sliderKey,{input:inp,output:val});
       row.append(name, inp, val);
       controls.appendChild(row);
     }
@@ -2413,6 +2627,32 @@ async function main() {
     });
     panel.appendChild(section);
   }
+  const presetSelect=document.createElement('select'); presetSelect.setAttribute('aria-label','Storm preset');
+  for(const [id,preset] of Object.entries(STORM_PRESETS)) presetSelect.add(new Option(preset.name,id));
+  presetSelect.add(new Option('Custom','custom')); presetSelect.value=activePreset;
+  const presetDescription=document.createElement('div'); presetDescription.className='measure-status';
+  presetDescription.textContent=STORM_PRESETS[activePreset].description;
+  const presetRow=document.createElement('label'); presetRow.className='resolution-row';
+  const presetName=document.createElement('span'); presetName.textContent='Sea state';
+  presetRow.append(presetName,presetSelect); stormControls.prepend(presetRow,presetDescription);
+  const crossRow=document.createElement('label'); const crossName=document.createElement('span'); crossName.textContent='Crossing angle (deg)';
+  const crossInput=document.createElement('input'); Object.assign(crossInput,{type:'range',min:-180,max:180,step:1});
+  const crossOutput=document.createElement('output'); crossRow.append(crossName,crossInput,crossOutput); stormControls.append(crossRow);
+  function syncCrossAngle() { crossInput.value=String(Math.round(crossingAngle(P.swellDir,P.swell2Dir))); crossOutput.textContent=crossInput.value; }
+  function syncSliders() { for(const [key,view] of sliderViews) { view.input.value=P[key]; view.output.textContent=String(P[key]); } syncCrossAngle(); }
+  syncSliders();
+  crossInput.addEventListener('input',()=>{
+    cancelRecording('Measurement cancelled: crossing angle changed.');
+    P.swell2Dir=(P.swellDir+Number(crossInput.value)+360)%360;
+    activePreset='custom'; presetSelect.value='custom'; syncSliders();
+  });
+  presetSelect.addEventListener('change',()=>{
+    const preset=STORM_PRESETS[presetSelect.value]; if(!preset) return;
+    cancelRecording('Measurement cancelled: sea state changed.');
+    activePreset=presetSelect.value; Object.assign(P,preset.values); syncSliders();
+    presetDescription.textContent=preset.description+' Blending to the new sea…';
+    foamFirst=true; envFull=2;
+  });
   let recording = null, lastReport = null;
   let measureStatus;
   function cancelRecording(reason) {
@@ -2450,20 +2690,24 @@ async function main() {
     select.addEventListener('change', () => { cancelRecording('Measurement cancelled: graphics changed.'); onChange(select); });
     row.append(name, select); graphicsControls.append(row); return select;
   }
-  addSelect('Anti-aliasing', [[4, '4× MSAA (default)'], [1, 'Off (1×)']], MSAA, async (select) => {
+  addSelect('Anti-aliasing', [[1, 'Off (1×, default)'], [4, '4× MSAA']], MSAA, async (select) => {
     select.disabled = true;
     try {
       const samples = Number(select.value);
-      [oceanPipe, skyPipe] = await scenePipelines(samples);
+      [oceanPipe, skyPipe, sprayPipe] = await scenePipelines(samples);
       bgOcean = [0, 1].map((i) => bg(oceanPipe, oceanEntries(i), 'ocean' + i));
       bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
       cancelRecording('Measurement cancelled: anti-aliasing changed.');
+      bgSpray=bg(sprayPipe,sprayEntries,'crest spindrift');
       MSAA = samples; resize();
     } catch (e) { stopRenderer('Anti-aliasing pipeline failed: ' + e.message); }
     finally { select.disabled = false; }
   });
   addSelect('Frame-rate cap', [[0, 'Unlimited'], [60, '60 FPS'], [30, '30 FPS']], fpsLimit,
     (select) => { fpsLimit = Number(select.value); nextFrameAt = 0; });
+  addSelect('Camera mode',[['surface','Ride waves'],['free','Free flight + guard']],cameraMode,(select)=>{
+    cameraMode=select.value; surfaceClearance=Math.max(0.9,cam.y-waterH);
+  });
   const measureButton = document.createElement('button');
   measureButton.type = 'button'; measureButton.textContent = 'Measure 15 seconds';
   measureStatus = document.createElement('div'); measureStatus.className = 'measure-status';
@@ -2475,6 +2719,8 @@ async function main() {
     recording = { start: null, frames: [], gpu: [],
       stages: Object.fromEntries(stageNames.map((name) => [name, []])) };
     measureButton.disabled = true; measureStatus.textContent = 'Measuring… explore for 15 seconds.';
+    panel.classList.add('hidden');
+    measureButton.blur();
   });
   downloadButton.addEventListener('click', () => {
     const url = URL.createObjectURL(new Blob([JSON.stringify(lastReport, null, 2)], { type: 'application/json' }));
@@ -2670,11 +2916,12 @@ async function main() {
       foamUF[8 + l] = ts;
     }
     foamFirst = false;
-    foamUF[10] = dt; foamUF[11] = 0.22;          // decay 1/s
-    foamUF[12] = 0.52 + 0.16 * P.foam; foamUF[13] = 2.0; foamUF[14] = 1.0; foamUF[15] = 0;
+    foamUF[10] = dt; foamUF[11] = 0.22-0.08*Math.min(E.storm,1);          // decay 1/s
+    foamUF[12] = 0.62 + 0.04*E.storm; foamUF[13] = 2.0; foamUF[14] = 1.0+E.storm; foamUF[15] = 0;
     for (let c = 0; c < C; c++) { foamUF[16 + c] = CASC_L[c]; foamUF[24 + c] = 1 / CASC_L[c]; }
-    const drift = 0.03 * P.windSpeed;
-    foamUF[32] = Math.cos(P.windDir * D2R) * drift; foamUF[33] = Math.sin(P.windDir * D2R) * drift;
+    const drift = (0.03+0.07*E.storm) * E.windSpeed;
+    foamUF[32] = Math.cos(E.windDir * D2R) * drift; foamUF[33] = Math.sin(E.windDir * D2R) * drift;
+    foamUF[36]=E.storm; foamUF[37]=seaBounds(E).hs;
     device.queue.writeBuffer(foamUBO, 0, foamUArr);
   }
 
@@ -2709,7 +2956,7 @@ async function main() {
           createdAt: new Date().toISOString(), durationMs: now - recording.start,
           userAgent: navigator.userAgent,
           adapter: info ? { vendor: info.vendor, architecture: info.architecture, description: info.description } : null,
-          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P } },
+          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P }, effectiveParameters:{...E}, preset:activePreset, cameraMode, camera:{...cam}, surfaceClearance,probeResidual,probeRejected:surfaceProbe.rejected,waterHeight:waterH },
           frames: summarizeSamples(recording.frames), gpu: summarizeSamples(recording.gpu),
           gpuStages: profile && hasTS ? Object.fromEntries(stageNames.map((name) => [name, summarizeSamples(recording.stages[name])])) : null,
           note: 'GPU samples are asynchronous, every eighth rendered frame. Stage profiling adds pass boundaries. This is a 15-second sample, not a thermal stability test.',
@@ -2719,6 +2966,10 @@ async function main() {
       }
     }
     if (fixedDt) dt = fixedDt;
+    const changing=advanceSea(E,P,dt);
+    for(const key of spectrumKeys) if(E[key]!==spectrumPrevious[key]) {needSpectrum=true;spectrumPrevious[key]=E[key];}
+    if(Math.fround(Math.round(E.haze*10)/10)!==atmoF[0]) needLUT=true;
+    if(!changing && STORM_PRESETS[activePreset]) presetDescription.textContent=STORM_PRESETS[activePreset].description;
     updateCamera(dt);
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
@@ -2741,7 +2992,7 @@ async function main() {
       needSpectrum = false;
     }
     if (needLUT) {
-      atmoF[0] = P.haze;
+      atmoF[0] = Math.round(E.haze*10)/10;
       device.queue.writeBuffer(atmoUBO, 0, atmoF);
       cp.setPipeline(transPipe);
       cp.setBindGroup(0, bgTrans);
@@ -2755,9 +3006,8 @@ async function main() {
     if (profile) { cp.end(); cp = enc.beginComputePass(stageDescs[1]); }
     encodeFoam(cp);
     if (profile) { cp.end(); cp = enc.beginComputePass(stageDescs[2]); }
-    cp.setPipeline(probePipe);
-    cp.setBindGroup(0, bgProbe);
-    cp.dispatchWorkgroups(1);
+    const doProbe=!probePending;
+    if(doProbe) { cp.setPipeline(probePipe); cp.setBindGroup(0,bgProbe); cp.dispatchWorkgroups(1); }
     // SKYVIEW_LUT depends only on clamped altitude, sun elevation, haze and its LUTs.
     // Camera yaw/position, clouds and time are applied by the sky/reflection shaders later.
     if (skyHeight !== frameF[73] || skySun !== frameF[33] || skyHaze !== frameF[72]) {
@@ -2794,9 +3044,10 @@ async function main() {
     rp.setPipeline(skyPipe);
     rp.setBindGroup(0, bgSky);
     rp.draw(3);
+    if(E.spray>0.001) { rp.setPipeline(sprayPipe); rp.setBindGroup(0,bgSpray); rp.draw(6,256); }
     rp.end();
 
-    for (let m = 0; m < (P.bloom > 0 ? bloomCount : 0); m++) {
+    for (let m = 0; m < (E.bloom > 0.0001 ? bloomCount : 0); m++) {
       downPasses[m].timestampWrites = profile && hasTS && m === 0 ?
         { querySet: tsQuery, beginningOfPassWriteIndex: 8 } : undefined;
       const p = enc.beginRenderPass(downPasses[m]);
@@ -2805,7 +3056,7 @@ async function main() {
       p.draw(3);
       p.end();
     }
-    for (let i = 0; i < (P.bloom > 0 ? upPasses.length : 0); i++) {
+    for (let i = 0; i < (E.bloom > 0.0001 ? upPasses.length : 0); i++) {
       const p = enc.beginRenderPass(upPasses[i]);
       p.setPipeline(upPipe);
       p.setBindGroup(0, upBGs[i]);
@@ -2813,12 +3064,12 @@ async function main() {
       p.end();
     }
 
-    compData[0] = P.exposure; compData[1] = P.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
-    compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19; compData[7] = 1 / bloomCount;
+    compData[0] = E.exposure; compData[1] = E.bloom; compData[2] = frameIndex % 64; compData[3] = 0.10;
+    compData[4] = 1.05; compData[5] = 1.06; compData[6] = -0.19*(1-Math.min(E.storm,1)*0.8); compData[7] = 1 / bloomCount;
     device.queue.writeBuffer(compUBO, 0, compData);
     const swapTex = ctx.getCurrentTexture();
     compPass.colorAttachments[0].view = swapTex.createView();
-    if (profile && hasTS) compPass.timestampWrites = P.bloom > 0 ?
+    if (profile && hasTS) compPass.timestampWrites = E.bloom > 0.0001 ?
       { querySet: tsQuery, endOfPassWriteIndex: 9 } : stageDescs[4].timestampWrites;
     const pc = enc.beginRenderPass(compPass);
     pc.setPipeline(compPipe);
@@ -2826,11 +3077,7 @@ async function main() {
     pc.draw(3);
     pc.end();
 
-    let doProbe = false;
-    if (!probePending && (frameIndex & 7) === 0) {
-      enc.copyBufferToBuffer(probeOut, 0, probeRead, 0, 16);
-      doProbe = true;
-    }
+    if(doProbe) enc.copyBufferToBuffer(probeOut,0,probeRead,0,32);
     let doTs = false;
     if (hasTS && !tsPending && (frameIndex & 7) === 0) {
       enc.resolveQuerySet(tsQuery, 0, queryCount, tsResolve, 0);
@@ -2883,6 +3130,18 @@ async function main() {
   }
 
   resize();
+  writeSimStatic(); simF[52]=simTime; simF[53]=1/60; device.queue.writeBuffer(simUBO,0,simF);
+  writeFrame(simTime); writeFoamUniforms(1/60);
+  const prime=device.createCommandEncoder(); const primePass=prime.beginComputePass();
+  primePass.setPipeline(initPipe); primePass.setBindGroup(0,bgInit); primePass.dispatchWorkgroups(N/16,N/16,C);
+  encodeSim(primePass); encodeFoam(primePass);
+  primePass.setPipeline(probePipe); primePass.setBindGroup(0,bgProbe); primePass.dispatchWorkgroups(1); primePass.end();
+  prime.copyBufferToBuffer(probeOut,0,probeRead,0,32); device.queue.submit([prime.finish()]);
+  await probeRead.mapAsync(GPUMapMode.READ); onProbe(); needSpectrum=false;
+  initializeSurfaceProbe(surfaceProbe,seaBounds(E).height);
+  waterH=surfaceProbe.height; waterGuard=surfaceProbe.guard;
+  cam.y=cameraMode==='surface'?Math.max(waterH+surfaceClearance,waterGuard+0.8):Math.max(cam.y,waterGuard+0.8);
+  last=performance.now();
   addEventListener('resize', resize);
   requestAnimationFrame(frame);
 }
