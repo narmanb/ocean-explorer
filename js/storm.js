@@ -53,3 +53,25 @@ export function surfaceCameraY(y,water,guard,clearance,dt) {
   const blend=1-Math.exp(-Math.max(0,dt)*(target>y?18:4));
   return Math.max(guard+0.8,y+(target-y)*blend);
 }
+
+// Keep the last trustworthy surface if an extreme folded patch defeats inversion.
+// Neighbors with a poor inverse residual must not push the camera to a false crest.
+export function updateSurfaceProbe(state,samples) {
+  if(samples.length!==8 || !samples.every(Number.isFinite)) return false;
+  let guard=-Infinity, valid=0, residual=0;
+  const centerValid=samples[4]>=0 && samples[4]<=0.05;
+  for(let k=0;k<4;k++) {
+    residual=Math.max(residual,samples[k+4]);
+    if(samples[k+4]>=0 && samples[k+4]<=0.05) { guard=Math.max(guard,samples[k]); valid++; }
+  }
+  if(centerValid) state.height=samples[0];
+  if(valid) state.guard=Math.max(guard,valid<4?state.guard:-Infinity);
+  state.residual=residual; state.rejected+=4-valid; state.centerValid=centerValid; state.validCount=valid;
+  return centerValid;
+}
+
+export function initializeSurfaceProbe(state,fallbackHeight) {
+  if(state.centerValid) return;
+  if(!state.validCount) state.guard=fallbackHeight;
+  state.height=state.guard;
+}

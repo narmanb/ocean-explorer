@@ -2,7 +2,7 @@
 // FFT ocean (6 cascades) + CDLOD surface mesh + physically based sky + HDR post.
 // Normal frames reuse uniform arrays and most descriptors. Optional diagnostics collect
 // samples; WebGPU swap-chain views and command buffers are necessarily transient.
-import { DEFAULT_SEA, STORM_PRESETS, STORM_CONTROLS, advanceSea, seaBounds, effectiveChop, crossingAngle, surfaceCameraY } from './storm.js';
+import { DEFAULT_SEA, STORM_PRESETS, STORM_CONTROLS, advanceSea, seaBounds, effectiveChop, crossingAngle, surfaceCameraY, updateSurfaceProbe, initializeSurfaceProbe } from './storm.js';
 import { SPINDRIFT } from './wgsl/spray.js';
 import { targetSize, bloomLevels, summarizeSamples } from './runtime.js';
 import { N, CASCADES, SKY_W, SKY_H, ENV_SIZE, ENV_MIPS } from './wgsl/common.js';
@@ -18,8 +18,8 @@ const D2R = Math.PI / 180;
 // ----------------------------------------------------------------------------------------
 // Tunable parameters (UI panel edits these)
 // ----------------------------------------------------------------------------------------
-export const P = { ...STORM_PRESETS[qs.get('preset')]?.values || STORM_PRESETS.cross.values };
-let activePreset = STORM_PRESETS[qs.get('preset')] ? qs.get('preset') : 'cross';
+export const P = { ...STORM_PRESETS[qs.get('preset')]?.values || STORM_PRESETS.original.values };
+let activePreset = STORM_PRESETS[qs.get('preset')] ? qs.get('preset') : 'original';
 const CASC_L = [1103.0, 211.3, 39.7, 7.43, 1.393, 0.2617];
 
 function fail(msg) {
@@ -330,11 +330,13 @@ async function main() {
   const probeRead = mkBuf(32, GU.MAP_READ | GU.COPY_DST, 'probe read');
   const bgProbe = bg(probePipe, [{ buffer: frameUBO }, fullArr(dispTex), samplerSim, { buffer: probeOut }, fullArr(derivTex)], 'probe');
   let probePending = false, waterH = 0, waterGuard = 0, probeResidual = 0;
+  const surfaceProbe={height:0,guard:0,residual:0,rejected:0,centerValid:false,validCount:0};
   const onProbe = () => {
     const heights = new Float32Array(probeRead.getMappedRange(0,32));
     if (heights.every(Number.isFinite)) {
-      probeResidual=Math.max(...heights.subarray(4));
-      waterH=heights[0]; waterGuard=Math.max(...heights.subarray(0,4));
+      updateSurfaceProbe(surfaceProbe,heights);
+      probeResidual=surfaceProbe.residual;
+      waterH=surfaceProbe.height; waterGuard=surfaceProbe.guard;
     } else stopRenderer('Water-height probe returned a non-finite value.');
     probeRead.unmap();
     probePending = false;
@@ -664,7 +666,7 @@ async function main() {
     // deep water body scatter colour (greenish coastal water), unresolved slope variance
     f[76] = 0.016 * E.turbidity; f[77] = 0.080 * E.turbidity; f[78] = 0.096 * E.turbidity; f[79] = 0.0024;
     f[80] = 0.035; f[81] = 0.120; f[82] = 0.085; f[83] = 2.6;
-    f[84] = 0.36 + 0.1 * E.foam + 0.05*E.storm; f[85] = 2.5; f[86] = 0.7+0.3*E.foam; f[87] = 1.0;
+    f[84] = 0.46 + 0.04*E.storm; f[85] = 2.5; f[86] = E.foam; f[87] = 1.0;
     f[88] = (5.802e-3 + 4.40e-3 * E.haze) * 1e-3;
     f[89] = (13.558e-3 + 4.40e-3 * E.haze) * 1e-3;
     f[90] = (33.1e-3 + 4.40e-3 * E.haze) * 1e-3;
@@ -868,6 +870,8 @@ async function main() {
     recording = { start: null, frames: [], gpu: [],
       stages: Object.fromEntries(stageNames.map((name) => [name, []])) };
     measureButton.disabled = true; measureStatus.textContent = 'Measuring… explore for 15 seconds.';
+    panel.classList.add('hidden');
+    measureButton.blur();
   });
   downloadButton.addEventListener('click', () => {
     const url = URL.createObjectURL(new Blob([JSON.stringify(lastReport, null, 2)], { type: 'application/json' }));
@@ -1064,7 +1068,7 @@ async function main() {
     }
     foamFirst = false;
     foamUF[10] = dt; foamUF[11] = 0.22-0.08*Math.min(E.storm,1);          // decay 1/s
-    foamUF[12] = 0.52 + 0.1 * E.foam+0.05*E.storm; foamUF[13] = 2.0; foamUF[14] = 1.0+E.storm; foamUF[15] = 0;
+    foamUF[12] = 0.62 + 0.04*E.storm; foamUF[13] = 2.0; foamUF[14] = 1.0+E.storm; foamUF[15] = 0;
     for (let c = 0; c < C; c++) { foamUF[16 + c] = CASC_L[c]; foamUF[24 + c] = 1 / CASC_L[c]; }
     const drift = (0.03+0.07*E.storm) * E.windSpeed;
     foamUF[32] = Math.cos(E.windDir * D2R) * drift; foamUF[33] = Math.sin(E.windDir * D2R) * drift;
@@ -1103,7 +1107,7 @@ async function main() {
           createdAt: new Date().toISOString(), durationMs: now - recording.start,
           userAgent: navigator.userAgent,
           adapter: info ? { vendor: info.vendor, architecture: info.architecture, description: info.description } : null,
-          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P }, effectiveParameters:{...E}, preset:activePreset, cameraMode, camera:{...cam}, surfaceClearance,probeResidual,waterHeight:waterH },
+          settings: { width: W, height: H, scale: renderScale, msaa: MSAA, fpsLimit, parameters: { ...P }, effectiveParameters:{...E}, preset:activePreset, cameraMode, camera:{...cam}, surfaceClearance,probeResidual,probeRejected:surfaceProbe.rejected,waterHeight:waterH },
           frames: summarizeSamples(recording.frames), gpu: summarizeSamples(recording.gpu),
           gpuStages: profile && hasTS ? Object.fromEntries(stageNames.map((name) => [name, summarizeSamples(recording.stages[name])])) : null,
           note: 'GPU samples are asynchronous, every eighth rendered frame. Stage profiling adds pass boundaries. This is a 15-second sample, not a thermal stability test.',
@@ -1285,7 +1289,9 @@ async function main() {
   primePass.setPipeline(probePipe); primePass.setBindGroup(0,bgProbe); primePass.dispatchWorkgroups(1); primePass.end();
   prime.copyBufferToBuffer(probeOut,0,probeRead,0,32); device.queue.submit([prime.finish()]);
   await probeRead.mapAsync(GPUMapMode.READ); onProbe(); needSpectrum=false;
-  cam.y=cameraMode==='surface'?waterH+surfaceClearance:Math.max(cam.y,waterGuard+0.8);
+  initializeSurfaceProbe(surfaceProbe,seaBounds(E).height);
+  waterH=surfaceProbe.height; waterGuard=surfaceProbe.guard;
+  cam.y=cameraMode==='surface'?Math.max(waterH+surfaceClearance,waterGuard+0.8):Math.max(cam.y,waterGuard+0.8);
   last=performance.now();
   addEventListener('resize', resize);
   requestAnimationFrame(frame);

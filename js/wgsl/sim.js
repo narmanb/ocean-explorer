@@ -334,7 +334,8 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   let fineD = pfbm(uv * 16.0, 16, 3) * 0.5 + 0.5;
   let big = m1 * (0.55 + 0.45 * m2) * (0.75 + 0.25 * b3);
   let fine = 0.45 + 0.55 * b3 * (0.7 + 0.3 * b4);
-  let streak = pfbm(uv * vec2f(4.0, 16.0), 4, 5) * 0.5 + 0.5;
+  // Wrap each axis at its own frequency: a scalar period repeated Y four times.
+  let streak = pfbmRect(uv * vec2f(4.0, 16.0), vec2i(4,16), 5) * 0.5 + 0.5;
   textureStore(dst, id.xy, vec4f(clamp(big * 0.6 + dens * 0.4, 0.0, 1.0), clamp(fine * 0.8 + fineD * 0.2, 0.0, 1.0), dens, streak));
 }
 `;
@@ -409,7 +410,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
   }
   let dt = U.p0.z;
   let steepCrest = smoothstep(0.28,0.8,length(slope)) * smoothstep(0.02,0.28,height/max(U.sea.y,1.0));
-  let inject = max(clamp((U.p1.x-J)*U.p1.y,0.0,1.0), steepCrest*min(U.sea.x,1.0)*0.8);
+  // Elevation alone painted entire wave faces white. A steep crest enhances
+  // actual compression, but cannot independently spawn a sheet of foam.
+  let inject = clamp((U.p1.x-J)*U.p1.y,0.0,1.0) * (1.0+steepCrest*min(U.sea.x,1.0)*0.25);
   var f = prev.r * exp(-dt * U.p0.w);
   f = max(f, inject);
   f = min(f + inject * dt * U.p1.z, 1.6);

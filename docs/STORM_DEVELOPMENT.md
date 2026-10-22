@@ -3,7 +3,7 @@
 Branch `extreme-storm-seas` builds on `mobile-ui-categories` at `8d6e6d9`.
 Mobile/desktop controls, graphics settings, the 15-second benchmark, six 256² FFT
 cascades, CDLOD mesh, standalone output and original MIT attribution are retained.
-Default MSAA is now 1×; 4× remains selectable. No main-branch merge is included.
+Startup now uses Original Sunset; see [the subsequent refinement](STORM_REFINEMENT.md). Default MSAA is 1×; 4× remains selectable. No main-branch merge is included.
 
 ## Simulation and appearance
 
@@ -13,7 +13,7 @@ wavelength, direction and directional concentration controls. Crossing angle
 controls the secondary direction relative to the primary. Peak sharpness and
 storm intensity affect actual spectrum energy; storm intensity also coordinates
 foam, wind drift, lighting and cloud treatment. Presets cover Calm Ocean, Rough
-Seas, Severe Storm, Cross Seas (startup), Cinematic Extreme and Original Sunset.
+Seas, Severe Storm, Cross Seas, Cinematic Extreme and Original Sunset.
 Targets blend with fixed random seeds and uninterrupted simulation time.
 
 The vertical simulation is not amplified after the FFT. A steepness-aware limit

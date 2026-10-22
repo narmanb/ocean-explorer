@@ -86,7 +86,8 @@ try {
   const context = await browser.newContext({ viewport: { width: 749, height: 360 }, hasTouch: true });
   const page = await context.newPage();
   await setup(page);
-  await ready(page, `http://localhost:${port}/?preset=original&touch=1&profile=1&clouds=0&veil=0`);
+  await ready(page, `http://localhost:${port}/?touch=1&profile=1&clouds=0&veil=0`);
+  check(await page.getByLabel('Storm preset',{exact:true}).inputValue()==='original','startup restores the original sunset preset');
   check(await page.locator('.settings-category').count() === 6, 'six settings categories');
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.locator('summary').filter({hasText:'Storm & Extreme Seas'}).click();
@@ -173,7 +174,9 @@ try {
   await page.evaluate(() => document.exitFullscreen()); await frames(page);
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('button', { name: 'Measure 15 seconds' }).click();
+  check(await page.locator('#panel').isHidden(),'measurement immediately closes the whole settings panel');
   await page.waitForFunction(() => !Array.from(document.querySelectorAll('button')).find((b) => b.textContent === 'Download last report').disabled, null, { timeout: 600000 });
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const download = page.waitForEvent('download'); await page.getByRole('button', { name: 'Download last report' }).click();
   const file = await download; const report = JSON.parse(fs.readFileSync(await file.path(), 'utf8'));
   check(report.durationMs >= 15000 && report.frames.frames > 0 && (encodeOnly ? report.gpu === null : report.gpu?.frames > 0), encodeOnly ? 'encoding-only report contains frame samples and honestly unavailable GPU timing' : 'report contains real frame and GPU samples');
@@ -187,7 +190,8 @@ try {
   for (const entry of ['index.html', 'ocean.html', 'ocean.min.html']) {
     const p = await context.newPage(); await p.setViewportSize({ width: 320, height: 180 }); await setup(p);
     const url = entry === 'index.html' ? `http://localhost:${port}/index.html` : pathToFileURL(path.join(root, entry)).href;
-    await ready(p, url + '?preset=original&touch=0&aa=1&clouds=0&veil=0');
+    await ready(p, url + '?touch=0&aa=1&clouds=0&veil=0');
+    check(await p.getByLabel('Storm preset',{exact:true}).inputValue()==='original',entry+' defaults to Original Sunset');
     check(await p.locator('#touch-ui').isHidden(), entry + ' desktop layout');
     const z = await p.evaluate(() => window.__audit.frame[18]); await p.keyboard.down('w'); await frames(p); await p.keyboard.up('w');
     check(await p.evaluate(() => window.__audit.frame[18]) < z, entry + ' desktop WASD');

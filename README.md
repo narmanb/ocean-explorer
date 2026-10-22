@@ -4,7 +4,7 @@ This fork of [Noniv/web-ocean](https://github.com/Noniv/web-ocean) adds mobile e
 
 ## Storm & Extreme Seas
 
-The page starts in **Cross Seas** with **1× MSAA**. Open Settings → Storm &
+The page starts in **Original Sunset**, restoring the pre-storm sea and lighting, with **1× MSAA**. Open Settings → Storm &
 Extreme Seas to choose Calm Ocean, Rough Seas, Severe Storm, Cross Seas,
 Cinematic Extreme, or Original Sunset. Presets blend smoothly over several
 seconds while simulation time keeps running.
@@ -19,14 +19,14 @@ intentional exaggeration, not a real-world forecast.
 The six FFT cascades remain 256². The second swell has independent random phases
 and uses the same FFTs. Storm-dependent foam, lower cloud banks, cooler light,
 sea mist and a bounded procedural crest-spindrift pass respond to the sea state.
-Mist and spindrift can each be turned off. No external artwork or large particle
+Mist and spindrift can each be turned off. Foam at zero disables surface foam; crest spindrift has its own independent control. No external artwork or large particle
 system is used.
 
 **Ride waves** (default): UP/DOWN adjusts height above the moving local water;
 you can descend into troughs below mean sea level. **Free flight + guard** retains
 free vertical movement with local water clearance. A damped inverse-displacement
-probe and expanded mesh bounds support the larger surface. Height tracking is
-asynchronous and cannot guarantee perfect clearance for every extreme manual
+probe and expanded mesh bounds support the larger surface. Height tracking rejects unconverged inverse samples and retains the last good
+surface. Tracking is asynchronous and cannot guarantee perfect clearance for every extreme manual
 setting. See [storm validation and limitations](docs/STORM_DEVELOPMENT.md).
 
 ## Mobile controls and settings
@@ -42,7 +42,7 @@ Open **`ocean.html`** or **`ocean.min.html`** directly in recent Chrome on a com
 - **Fullscreen:** use the fullscreen button when the browser supports it.
 - **Anti-aliasing:** off / 1× by default; 4× MSAA remains available. Analytic wave/sky anti-aliasing stays active.
 - **Frame-rate cap:** Unlimited (original default), 60 or 30 FPS.
-- **Measure 15 seconds:** record a repeatable sample and download its JSON report under Graphics & Performance. GPU stage timing is optional and reloads the page with the current scene/settings. Warm up before measuring; a 15-second sample is not a thermal stability test.
+- **Measure 15 seconds:** immediately closes the settings panel so you can explore while recording. After 15 seconds, reopen Settings → Graphics & Performance to download the JSON report. GPU stage timing is optional and reloads the page with the current scene/settings. Warm up before measuring; a 15-second sample is not a thermal stability test.
 
 Touch controls are shown on coarse-pointer devices. Append `?touch=1` to force them on or `?touch=0` to force them off. Append `?scale=0.65` to start at a lower render resolution. On mobile, scale 1× uses CSS pixel dimensions (rather than the usually higher device-pixel-ratio rendering size); on desktop it uses native device-pixel-ratio dimensions. Explicit `?w=` / `?h=` settings still override dimensions.
 
@@ -50,7 +50,7 @@ Desktop WASD, mouse look, H for settings, Shift boost, and Space/E/Q/C for altit
 
 See [the mobile audit](docs/MOBILE_AUDIT.md) for changes, resource/work analysis, browser test limits and the Galaxy S25+ checklist. The user supplied an earlier 15-second phone report of roughly 51.2 FPS / 18.59 ms GPU at 780×360 and 4× MSAA. There is no new phone measurement for the storm build and no claim of stable 60 FPS.
 
-Run `npm ci`, `npm run build`, `npm test` and `npm run check:build` to verify both standalone pages match source. Browser tooling is optional and documented in the audit. Native Android presentation, physical touch and sustained performance still require phone testing.
+Run `npm ci`, `npm run build`, `npm test` and `npm run check:build` to verify both standalone pages match source. Browser tooling is optional and documented in the audit. Native Android presentation, physical touch and sustained performance still require phone testing. See [the storm refinement results](docs/STORM_REFINEMENT.md) for the foam, shading, sky and camera corrections.
 
 ## Original project documentation
 
